@@ -1,0 +1,14 @@
+{
+  "name": "codex-glm-proxy",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Lightweight local Responses proxy for Codex headless GLM-5.2 calls through XFYun MaaS.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "check": "node --check server.js",
+    "start": "node server.js"
+  }
+}
