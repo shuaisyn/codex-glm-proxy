@@ -52,6 +52,9 @@ function addModelId(ids, value) {
 }
 
 function modelIds(provider, cfg) {
+  const localCatalogIds = Object.keys(readCodexModelCatalogBySlug());
+  if (localCatalogIds.length) return localCatalogIds;
+
   const ids = new Set();
   const catalog = cfg.modelCatalog && Array.isArray(cfg.modelCatalog.models)
     ? cfg.modelCatalog.models
@@ -59,6 +62,7 @@ function modelIds(provider, cfg) {
   for (const item of catalog) {
     addModelId(ids, typeof item === 'string' ? item : item && (item.model || item.id || item.slug));
   }
+  if (ids.size) return [...ids];
   addModelId(ids, provider.model);
   if (typeof provider.models === 'string') provider.models.split(/\r?\n|,/).forEach(v => addModelId(ids, v));
   if (!ids.size) {
@@ -122,15 +126,25 @@ function modelPayload(provider) {
     { effort: 'xhigh', description: 'Extra high reasoning depth for complex problems' },
   ];
   const metadata = {
-    xopglm52: {
-      displayName: 'GLM-5.2',
-      description: 'iFlytek MaaS Coding Plan GLM-5.2.',
-      priority: 40,
+    'astron-code-latest': {
+      displayName: 'Astron Code Latest',
+      description: 'iFlytek MaaS Coding Plan Astron Code Latest.',
+      priority: 10,
     },
     xopdeepseekv4pro: {
       displayName: 'DeepSeek-V4-Pro',
       description: 'iFlytek MaaS Coding Plan DeepSeek-V4-Pro.',
-      priority: 39,
+      priority: 20,
+    },
+    xopdeepseekv4flash: {
+      displayName: 'DeepSeek-V4-Flash',
+      description: 'iFlytek MaaS Coding Plan DeepSeek-V4-Flash.',
+      priority: 30,
+    },
+    xopdeepseekv32: {
+      displayName: 'DeepSeek-V3.2',
+      description: 'iFlytek MaaS Coding Plan DeepSeek-V3.2.',
+      priority: 40,
     },
   };
   const models = provider.models.map(id => {

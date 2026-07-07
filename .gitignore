@@ -1,3 +1,5 @@
 logs/
 .env
 *.local.json
+requests*.log
+requests*.err.log
