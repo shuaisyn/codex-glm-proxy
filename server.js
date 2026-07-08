@@ -106,6 +106,9 @@ function readProvider(providerId = DEFAULT_PROVIDER_ID) {
   const baseUrl = target.baseUrl
     || process.env.XF_MAAS_RESPONSES_URL
     || 'https://maas-coding-api.cn-huabei-1.xf-yun.com/v1/responses';
+  const chatCompletionsUrl = target.chatCompletionsUrl
+    || process.env.XF_MAAS_CHAT_COMPLETIONS_URL
+    || 'https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions';
 
   if (!apiKey) throw new Error(`provider has no local api key: ${providerId}`);
 
@@ -113,6 +116,7 @@ function readProvider(providerId = DEFAULT_PROVIDER_ID) {
     id: provider.id || providerId,
     name: provider.name || providerId,
     baseUrl,
+    chatCompletionsUrl,
     apiKey,
     models: modelIds(provider, cfg),
   };
@@ -498,6 +502,86 @@ async function proxyResponses(req, res, provider) {
   try { res.end(); } catch (_) {}
 }
 
+async function proxyChatCompletions(req, res, provider) {
+  let body;
+  try {
+    body = await readJsonBody(req);
+  } catch (e) {
+    json(res, 400, { error: `invalid json body: ${e.message}` });
+    return;
+  }
+
+  const reqId = `chat-${(++requestSeq).toString(36)}`;
+  const startedAt = Date.now();
+  console.log(`[glm-proxy] [${reqId}] chat start ${JSON.stringify({
+    model: body && body.model || null,
+    stream: Boolean(body && body.stream),
+    messages: Array.isArray(body && body.messages) ? body.messages.length : null,
+  })}`);
+
+  for (let attempt = 1; attempt <= BUSY_RETRY_MAX; attempt++) {
+    let upstream;
+    try {
+      upstream = await fetch(provider.chatCompletionsUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: body && body.stream ? 'text/event-stream' : 'application/json',
+          Authorization: `Bearer ${provider.apiKey}`,
+        },
+        body: JSON.stringify(body || {}),
+      });
+    } catch (e) {
+      json(res, 502, { error: `fetch upstream failed: ${e && e.message ? e.message : String(e)}` });
+      return;
+    }
+
+    if (!upstream.ok) {
+      let detail = '';
+      try { detail = await upstream.text(); } catch (_) {}
+      if (isTransientXfBusy(detail) && attempt < BUSY_RETRY_MAX) {
+        const delay = BUSY_RETRY_DELAYS_MS[Math.min(attempt - 1, BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
+        console.warn(`[glm-proxy] [${reqId}] chat upstream busy; retrying ${attempt + 1}/${BUSY_RETRY_MAX}`);
+        await sleep(delay);
+        continue;
+      }
+      res.writeHead(upstream.status, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(detail || JSON.stringify({ error: `upstream ${upstream.status}` }));
+      return;
+    }
+
+    const contentType = upstream.headers.get('content-type') || (body && body.stream ? 'text/event-stream' : 'application/json');
+    res.writeHead(upstream.status, {
+      'Content-Type': contentType,
+      'Cache-Control': body && body.stream ? 'no-cache' : 'no-store',
+      Connection: body && body.stream ? 'keep-alive' : 'close',
+    });
+
+    if (!upstream.body) {
+      res.end();
+      return;
+    }
+
+    try {
+      for await (const chunk of upstream.body) {
+        res.write(Buffer.from(chunk));
+      }
+    } catch (e) {
+      if (!res.destroyed) {
+        res.write(`\n${JSON.stringify({ error: `stream error: ${e && e.message ? e.message : String(e)}` })}`);
+      }
+    } finally {
+      console.log(`[glm-proxy] [${reqId}] chat end ${JSON.stringify({
+        status: upstream.status,
+        attempt,
+        durMs: Date.now() - startedAt,
+      })}`);
+      try { res.end(); } catch (_) {}
+    }
+    return;
+  }
+}
+
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
   const providerId = url.searchParams.get('provider') || DEFAULT_PROVIDER_ID;
@@ -519,6 +603,7 @@ async function route(req, res) {
       models: provider.models,
       retryMax: BUSY_RETRY_MAX,
       upstream: provider.baseUrl,
+      chatCompletionsUpstream: provider.chatCompletionsUrl,
     });
     return;
   }
@@ -530,6 +615,11 @@ async function route(req, res) {
 
   if (req.method === 'POST' && (url.pathname === '/v1/responses' || url.pathname.endsWith('/responses'))) {
     await proxyResponses(req, res, provider);
+    return;
+  }
+
+  if (req.method === 'POST' && (url.pathname === '/v1/chat/completions' || url.pathname.endsWith('/chat/completions'))) {
+    await proxyChatCompletions(req, res, provider);
     return;
   }
 

@@ -5,6 +5,7 @@
 ## 作用
 
 - 提供 `http://127.0.0.1:3017/v1/responses` 给 Codex 使用。
+- 提供 `http://127.0.0.1:3017/v1/chat/completions` 给 AionUI/OpenAI 兼容客户端使用。
 - 从 `..\MultiCC\providers.json` 读取本地讯飞 MaaS provider 配置和密钥。
 - 不复制、不打印、不提交密钥。
 - 对讯飞 `10012 / EngineInternalError:1105 / system busy` 做代理层重试。
