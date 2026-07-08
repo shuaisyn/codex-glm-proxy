@@ -16,6 +16,8 @@ const CHAT_BUSY_RETRY_MAX = Math.max(
   parseInt(process.env.XF_CHAT_BUSY_RETRY_MAX || '12', 10) || 12
 );
 const CHAT_BUSY_RETRY_DELAYS_MS = [500, 1000, 2000, 4000, 7000, 10000, 10000, 10000, 10000, 10000, 10000];
+const CHAT_PANEL_DIAGNOSTICS = process.env.XF_CHAT_PANEL_DIAGNOSTICS !== '0';
+const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 const DEFAULT_CODEX_MODEL_CATALOG = path.join(
   process.env.USERPROFILE || process.env.HOME || '',
   '.codex',
@@ -42,6 +44,80 @@ function json(res, status, body) {
 
 function isTransientXfBusy(message) {
   return /EngineInternalError:1105|system is busy|try again later|code:\s*10012/i.test(String(message || ''));
+}
+
+function sanitizeUpstreamDetail(detail) {
+  return String(detail || '')
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/g, 'Bearer ***')
+    .replace(/"api[_-]?key"\s*:\s*"[^"]+"/gi, '"api_key":"***"')
+    .slice(0, 500);
+}
+
+function isRetryableUpstreamFailure(status, detail) {
+  return RETRYABLE_HTTP_STATUSES.has(Number(status)) || isTransientXfBusy(detail);
+}
+
+function upstreamFailureSummary(status, detail) {
+  const safeDetail = sanitizeUpstreamDetail(detail);
+  let parsed;
+  try { parsed = safeDetail ? JSON.parse(safeDetail) : null; } catch (_) {}
+  const message = parsed && parsed.error && typeof parsed.error === 'object'
+    ? parsed.error.message || parsed.error.code || safeDetail
+    : parsed && parsed.error
+      ? parsed.error
+      : safeDetail;
+  return `上游返回 ${status}${message ? `：${String(message).slice(0, 180)}` : ''}`;
+}
+
+function chatChunk(body, content, finishReason = null) {
+  return {
+    id: `chatcmpl_glm_proxy_${Date.now().toString(36)}`,
+    object: 'chat.completion.chunk',
+    created: Math.floor(Date.now() / 1000),
+    model: body && body.model || 'unknown',
+    choices: [{
+      index: 0,
+      delta: content ? { role: 'assistant', content } : {},
+      finish_reason: finishReason,
+    }],
+  };
+}
+
+function writeChatDiagnosticChunk(res, body, content, finishReason = null) {
+  res.write(`data: ${JSON.stringify(chatChunk(body, content, finishReason))}\n\n`);
+}
+
+function retryDiagnosticText({ attempt, maxAttempts, delay, status, detail }) {
+  return [
+    '',
+    `【代理提示】${upstreamFailureSummary(status, detail)}。`,
+    `正在重试第 ${attempt + 1}/${maxAttempts} 次，约 ${Math.round(delay / 1000)} 秒后继续。`,
+    '',
+  ].join('\n');
+}
+
+function finalDiagnosticText({ attempts, status, detail }) {
+  return [
+    '',
+    `【代理提示】${upstreamFailureSummary(status, detail)}。`,
+    `已重试 ${attempts} 次仍失败，这通常是上游模型服务繁忙或网关异常。`,
+    '可以稍后重新发送，或临时切换模型。',
+  ].join('\n');
+}
+
+function sendChatDiagnosticJson(res, body, text) {
+  const payload = {
+    id: `chatcmpl_glm_proxy_${Date.now().toString(36)}`,
+    object: 'chat.completion',
+    created: Math.floor(Date.now() / 1000),
+    model: body && body.model || 'unknown',
+    choices: [{
+      index: 0,
+      message: { role: 'assistant', content: text.trim() },
+      finish_reason: 'stop',
+    }],
+  };
+  json(res, 200, payload);
 }
 
 function providerList(raw) {
@@ -529,7 +605,10 @@ async function proxyChatCompletions(req, res, provider) {
     ) || null,
   })}`);
 
-  for (let attempt = 1; attempt <= BUSY_RETRY_MAX; attempt++) {
+  let streamedDiagnostics = false;
+  let lastFailure = null;
+
+  for (let attempt = 1; attempt <= CHAT_BUSY_RETRY_MAX; attempt++) {
     let upstream;
     try {
       upstream = await fetch(provider.chatCompletionsUrl, {
@@ -542,21 +621,100 @@ async function proxyChatCompletions(req, res, provider) {
         body: JSON.stringify(body || {}),
       });
     } catch (e) {
-      json(res, 502, { error: `fetch upstream failed: ${e && e.message ? e.message : String(e)}` });
+      const detail = `fetch upstream failed: ${e && e.message ? e.message : String(e)}`;
+      lastFailure = { status: 502, detail };
+      if (attempt < CHAT_BUSY_RETRY_MAX) {
+        const delay = CHAT_BUSY_RETRY_DELAYS_MS[Math.min(attempt - 1, CHAT_BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
+        console.warn(`[glm-proxy] [${reqId}] chat upstream fetch failed; retrying ${attempt + 1}/${CHAT_BUSY_RETRY_MAX}`);
+        if (body && body.stream && CHAT_PANEL_DIAGNOSTICS) {
+          if (!res.headersSent) {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              Connection: 'keep-alive',
+            });
+          }
+          streamedDiagnostics = true;
+          writeChatDiagnosticChunk(res, body, retryDiagnosticText({
+            attempt,
+            maxAttempts: CHAT_BUSY_RETRY_MAX,
+            delay,
+            status: 502,
+            detail,
+          }));
+        }
+        await sleep(delay);
+        continue;
+      }
+      if (body && body.stream && CHAT_PANEL_DIAGNOSTICS) {
+        if (!res.headersSent) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+          });
+        }
+        writeChatDiagnosticChunk(res, body, finalDiagnosticText({ attempts: attempt, status: 502, detail }));
+        writeChatDiagnosticChunk(res, body, '', 'stop');
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+      if (CHAT_PANEL_DIAGNOSTICS) {
+        sendChatDiagnosticJson(res, body, finalDiagnosticText({ attempts: attempt, status: 502, detail }));
+        return;
+      }
+      json(res, 502, { error: detail });
       return;
     }
 
     if (!upstream.ok) {
       let detail = '';
       try { detail = await upstream.text(); } catch (_) {}
-      if (isTransientXfBusy(detail) && attempt < CHAT_BUSY_RETRY_MAX) {
+      lastFailure = { status: upstream.status, detail };
+      if (isRetryableUpstreamFailure(upstream.status, detail) && attempt < CHAT_BUSY_RETRY_MAX) {
         const delay = CHAT_BUSY_RETRY_DELAYS_MS[Math.min(attempt - 1, CHAT_BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
-        console.warn(`[glm-proxy] [${reqId}] chat upstream busy; retrying ${attempt + 1}/${CHAT_BUSY_RETRY_MAX}`);
+        console.warn(`[glm-proxy] [${reqId}] chat upstream ${upstream.status}; retrying ${attempt + 1}/${CHAT_BUSY_RETRY_MAX}`);
+        if (body && body.stream && CHAT_PANEL_DIAGNOSTICS) {
+          if (!res.headersSent) {
+            res.writeHead(200, {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              Connection: 'keep-alive',
+            });
+          }
+          streamedDiagnostics = true;
+          writeChatDiagnosticChunk(res, body, retryDiagnosticText({
+            attempt,
+            maxAttempts: CHAT_BUSY_RETRY_MAX,
+            delay,
+            status: upstream.status,
+            detail,
+          }));
+        }
         await sleep(delay);
         continue;
       }
-      if (isTransientXfBusy(detail)) {
-        console.warn(`[glm-proxy] [${reqId}] chat upstream busy exhausted after ${attempt} attempts`);
+      if (isRetryableUpstreamFailure(upstream.status, detail)) {
+        console.warn(`[glm-proxy] [${reqId}] chat upstream ${upstream.status} exhausted after ${attempt} attempts`);
+      }
+      if (body && body.stream && CHAT_PANEL_DIAGNOSTICS && (res.headersSent || isRetryableUpstreamFailure(upstream.status, detail))) {
+        if (!res.headersSent) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+          });
+        }
+        writeChatDiagnosticChunk(res, body, finalDiagnosticText({ attempts: attempt, status: upstream.status, detail }));
+        writeChatDiagnosticChunk(res, body, '', 'stop');
+        res.write('data: [DONE]\n\n');
+        res.end();
+        return;
+      }
+      if (CHAT_PANEL_DIAGNOSTICS && isRetryableUpstreamFailure(upstream.status, detail)) {
+        sendChatDiagnosticJson(res, body, finalDiagnosticText({ attempts: attempt, status: upstream.status, detail }));
+        return;
       }
       res.writeHead(upstream.status, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(detail || JSON.stringify({ error: `upstream ${upstream.status}` }));
@@ -564,11 +722,13 @@ async function proxyChatCompletions(req, res, provider) {
     }
 
     const contentType = upstream.headers.get('content-type') || (body && body.stream ? 'text/event-stream' : 'application/json');
-    res.writeHead(upstream.status, {
-      'Content-Type': contentType,
-      'Cache-Control': body && body.stream ? 'no-cache' : 'no-store',
-      Connection: body && body.stream ? 'keep-alive' : 'close',
-    });
+    if (!res.headersSent) {
+      res.writeHead(upstream.status, {
+        'Content-Type': contentType,
+        'Cache-Control': body && body.stream ? 'no-cache' : 'no-store',
+        Connection: body && body.stream ? 'keep-alive' : 'close',
+      });
+    }
 
     if (!upstream.body) {
       res.end();
@@ -587,10 +747,20 @@ async function proxyChatCompletions(req, res, provider) {
       console.log(`[glm-proxy] [${reqId}] chat end ${JSON.stringify({
         status: upstream.status,
         attempt,
+        streamedDiagnostics,
         durMs: Date.now() - startedAt,
       })}`);
       try { res.end(); } catch (_) {}
     }
+    return;
+  }
+
+  if (!res.headersSent && CHAT_PANEL_DIAGNOSTICS && lastFailure) {
+    sendChatDiagnosticJson(res, body, finalDiagnosticText({
+      attempts: CHAT_BUSY_RETRY_MAX,
+      status: lastFailure.status,
+      detail: lastFailure.detail,
+    }));
     return;
   }
 }

@@ -9,6 +9,7 @@
 - 从 `..\MultiCC\providers.json` 读取本地讯飞 MaaS provider 配置和密钥。
 - 不复制、不打印、不提交密钥。
 - 对讯飞 `10012 / EngineInternalError:1105 / system busy` 做代理层重试。
+- AionUI 使用 `/v1/chat/completions` 流式调用时，上游 408/429/500/502/503/504 或忙碌错误会直接在会话面板里显示代理重试提示。
 - 如果上游有输出但缺少 `response.completed`，在代理层补齐，减少 Codex 外层断流。
 
 ## 常用命令
@@ -46,6 +47,7 @@
 - `MULTICC_PROVIDERS_JSON`
 - `XF_BUSY_RETRY_MAX`
 - `XF_CHAT_BUSY_RETRY_MAX`
+- `XF_CHAT_PANEL_DIAGNOSTICS`：默认开启；设为 `0` 可关闭 AionUI 面板里的代理诊断提示。
 - `XF_MAAS_API_KEY`
 - `XF_MAAS_RESPONSES_URL`
 - `XF_MAAS_CHAT_COMPLETIONS_URL`
