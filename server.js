@@ -132,7 +132,6 @@ function modelPayload(provider) {
     { effort: 'low', description: 'Fast responses with lighter reasoning' },
     { effort: 'medium', description: 'Balances speed and reasoning depth for everyday tasks' },
     { effort: 'high', description: 'Greater reasoning depth for complex problems' },
-    { effort: 'xhigh', description: 'Extra high reasoning depth for complex problems' },
   ];
   const metadata = {
     'astron-code-latest': {
@@ -175,7 +174,7 @@ function modelPayload(provider) {
       created: 0,
       owned_by: 'codex-glm-proxy',
       provider: 'xf_maas_coding',
-      default_reasoning_level: 'xhigh',
+      default_reasoning_level: 'high',
       supported_reasoning_levels: supportedReasoningLevels,
       shell_type: 'shell_command',
       visibility: 'list',
@@ -522,6 +521,12 @@ async function proxyChatCompletions(req, res, provider) {
     model: body && body.model || null,
     stream: Boolean(body && body.stream),
     messages: Array.isArray(body && body.messages) ? body.messages.length : null,
+    reasoningEffort: body && (
+      body.reasoning_effort
+      || body.reasoning && body.reasoning.effort
+      || body.extra_body && body.extra_body.reasoning_effort
+      || body.extra_body && body.extra_body.reasoning && body.extra_body.reasoning.effort
+    ) || null,
   })}`);
 
   for (let attempt = 1; attempt <= BUSY_RETRY_MAX; attempt++) {

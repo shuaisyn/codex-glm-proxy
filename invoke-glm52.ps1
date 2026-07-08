@@ -41,7 +41,7 @@ $argsList = @(
   "-c", 'model="xopglm52"',
   "-c", "model_providers.xf_maas_coding.base_url=`"$BaseUrl`"",
   "-c", 'model_providers.xf_maas_coding.wire_api="responses"',
-  "-c", 'model_reasoning_effort="xhigh"',
+  "-c", 'model_reasoning_effort="high"',
   "-c", 'model_supports_reasoning_summaries=true',
   "-c", 'model_reasoning_summary="none"',
   $Prompt
