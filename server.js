@@ -11,10 +11,15 @@ const DEFAULT_PROVIDERS_FILE = path.resolve(__dirname, '..', 'MultiCC', 'provide
 const PROVIDERS_FILE = process.env.MULTICC_PROVIDERS_JSON || DEFAULT_PROVIDERS_FILE;
 const BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_BUSY_RETRY_MAX || '8', 10) || 8);
 const BUSY_RETRY_DELAYS_MS = [250, 600, 1200, 2200, 4000, 6500, 9000];
-const CHAT_BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_CHAT_BUSY_RETRY_MAX || '5', 10) || 5);
-const CHAT_BUSY_RETRY_DELAYS_MS = [2000, 5000, 10000, 20000, 30000];
+const CHAT_DIAGNOSTIC_EVERY = Math.max(1, parseInt(process.env.XF_CHAT_DIAGNOSTIC_EVERY || '5', 10) || 5);
+const CHAT_BUSY_RETRY_DELAYS_MS = [2000, 5000, 10000, 15000];
+const CHAT_STEADY_RETRY_DELAY_MS = Math.max(
+  1000,
+  parseInt(process.env.XF_CHAT_STEADY_RETRY_DELAY_MS || '15000', 10) || 15000
+);
 const CHAT_PANEL_DIAGNOSTICS = process.env.XF_CHAT_PANEL_DIAGNOSTICS !== '0';
 const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const PROXY_DIAGNOSTIC_LINE_RE = /^\s*`?\s*proxy\s+(?:retry\b|·\s+upstream\b)[^\r\n`]*`?\s*$/i;
 const DEFAULT_CODEX_MODEL_CATALOG = path.join(
   process.env.USERPROFILE || process.env.HOME || '',
   '.codex',
@@ -43,13 +48,6 @@ function isTransientXfBusy(message) {
   return /EngineInternalError:1105|system is busy|try again later|code:\s*10012/i.test(String(message || ''));
 }
 
-function sanitizeUpstreamDetail(detail) {
-  return String(detail || '')
-    .replace(/Bearer\s+[A-Za-z0-9._-]+/g, 'Bearer ***')
-    .replace(/"api[_-]?key"\s*:\s*"[^"]+"/gi, '"api_key":"***"')
-    .slice(0, 500);
-}
-
 function isRetryableUpstreamFailure(status, detail) {
   return RETRYABLE_HTTP_STATUSES.has(Number(status)) || isTransientXfBusy(detail);
 }
@@ -72,17 +70,63 @@ function writeChatDiagnosticChunk(res, body, content, finishReason = null) {
   res.write(`data: ${JSON.stringify(chatChunk(body, content, finishReason))}\n\n`);
 }
 
-function retryDiagnosticText({ retry, maxRetries, delay, status }) {
-  return `\`proxy retry · ${status} · ${retry}/${maxRetries} · next ${Math.round(delay / 1000)}s\`\n\n`;
+function retryDiagnosticText({ failures, delay, status }) {
+  return `\`proxy · upstream ${status} · ${failures} failures · retrying every ${Math.round(delay / 1000)}s\`\n\n`;
 }
 
-function abortChatAfterRetries(res, status, detail) {
-  const message = `upstream ${status} after retries: ${sanitizeUpstreamDetail(detail)}`;
-  if (res.headersSent) {
-    res.destroy(new Error(message));
-    return;
+function retryDelayMs(failures) {
+  if (failures >= CHAT_DIAGNOSTIC_EVERY) return CHAT_STEADY_RETRY_DELAY_MS;
+  return CHAT_BUSY_RETRY_DELAYS_MS[Math.min(failures - 1, CHAT_BUSY_RETRY_DELAYS_MS.length - 1)]
+    || CHAT_STEADY_RETRY_DELAY_MS;
+}
+
+function shouldShowChatDiagnostic(failures) {
+  return failures > 0 && failures % CHAT_DIAGNOSTIC_EVERY === 0;
+}
+
+function stripProxyDiagnosticText(value) {
+  if (typeof value !== 'string' || !value.toLowerCase().includes('proxy')) return value;
+  const lines = value.split(/\r?\n/);
+  const kept = lines.filter(line => !PROXY_DIAGNOSTIC_LINE_RE.test(line));
+  if (kept.length === lines.length) return value;
+  return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function sanitizeMessageContent(content) {
+  if (typeof content === 'string') return stripProxyDiagnosticText(content);
+  if (Array.isArray(content)) {
+    return content.map(part => {
+      if (!part || typeof part !== 'object') return part;
+      if (typeof part.text === 'string') {
+        return { ...part, text: stripProxyDiagnosticText(part.text) };
+      }
+      if (typeof part.content === 'string') {
+        return { ...part, content: stripProxyDiagnosticText(part.content) };
+      }
+      return part;
+    }).filter(part => {
+      if (!part || typeof part !== 'object') return true;
+      if (Object.prototype.hasOwnProperty.call(part, 'text')) return part.text !== '';
+      if (Object.prototype.hasOwnProperty.call(part, 'content')) return part.content !== '';
+      return true;
+    });
   }
-  json(res, status, { error: message });
+  return content;
+}
+
+function sanitizeChatBody(body) {
+  if (!body || !Array.isArray(body.messages)) return body;
+  return {
+    ...body,
+    messages: body.messages.map(message => {
+      if (!message || typeof message !== 'object') return message;
+      return { ...message, content: sanitizeMessageContent(message.content) };
+    }).filter(message => {
+      if (!message || typeof message !== 'object') return true;
+      if (Array.isArray(message.content)) return message.content.length > 0;
+      return message.content !== '';
+    }),
+  };
 }
 
 function providerList(raw) {
@@ -556,6 +600,8 @@ async function proxyChatCompletions(req, res, provider) {
     return;
   }
 
+  body = sanitizeChatBody(body);
+
   const reqId = `chat-${(++requestSeq).toString(36)}`;
   const startedAt = Date.now();
   console.log(`[glm-proxy] [${reqId}] chat start ${JSON.stringify({
@@ -572,9 +618,9 @@ async function proxyChatCompletions(req, res, provider) {
 
   let streamedDiagnostics = false;
   let lastFailure = null;
+  let consecutiveFailures = 0;
 
-  for (let attempt = 1; attempt <= CHAT_BUSY_RETRY_MAX + 1; attempt++) {
-    const retry = attempt;
+  for (let attempt = 1; !res.destroyed; attempt++) {
     let upstream;
     try {
       upstream = await fetch(provider.chatCompletionsUrl, {
@@ -589,41 +635,37 @@ async function proxyChatCompletions(req, res, provider) {
     } catch (e) {
       const detail = `fetch upstream failed: ${e && e.message ? e.message : String(e)}`;
       lastFailure = { status: 502, detail };
-      if (retry <= CHAT_BUSY_RETRY_MAX) {
-        const delay = CHAT_BUSY_RETRY_DELAYS_MS[Math.min(retry - 1, CHAT_BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
-        console.warn(`[glm-proxy] [${reqId}] chat upstream fetch failed; retrying ${retry}/${CHAT_BUSY_RETRY_MAX}`);
-        if (body && body.stream && CHAT_PANEL_DIAGNOSTICS) {
-          if (!res.headersSent) {
-            res.writeHead(200, {
-              'Content-Type': 'text/event-stream',
-              'Cache-Control': 'no-cache',
-              Connection: 'keep-alive',
-            });
-          }
-          streamedDiagnostics = true;
-          writeChatDiagnosticChunk(res, body, retryDiagnosticText({
-            retry,
-            maxRetries: CHAT_BUSY_RETRY_MAX,
-            delay,
-            status: 502,
-            detail,
-          }));
+      consecutiveFailures += 1;
+      const delay = retryDelayMs(consecutiveFailures);
+      console.warn(`[glm-proxy] [${reqId}] chat upstream fetch failed; failure ${consecutiveFailures}; next ${delay}ms`);
+      if (body && body.stream && CHAT_PANEL_DIAGNOSTICS && shouldShowChatDiagnostic(consecutiveFailures)) {
+        if (!res.headersSent) {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+          });
         }
-        await sleep(delay);
-        continue;
+        streamedDiagnostics = true;
+        writeChatDiagnosticChunk(res, body, retryDiagnosticText({
+          failures: consecutiveFailures,
+          delay: CHAT_STEADY_RETRY_DELAY_MS,
+          status: 502,
+        }));
       }
-      abortChatAfterRetries(res, 502, detail);
-      return;
+      await sleep(delay);
+      continue;
     }
 
     if (!upstream.ok) {
       let detail = '';
       try { detail = await upstream.text(); } catch (_) {}
       lastFailure = { status: upstream.status, detail };
-      if (isRetryableUpstreamFailure(upstream.status, detail) && retry <= CHAT_BUSY_RETRY_MAX) {
-        const delay = CHAT_BUSY_RETRY_DELAYS_MS[Math.min(retry - 1, CHAT_BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
-        console.warn(`[glm-proxy] [${reqId}] chat upstream ${upstream.status}; retrying ${retry}/${CHAT_BUSY_RETRY_MAX}`);
-        if (body && body.stream && CHAT_PANEL_DIAGNOSTICS) {
+      if (isRetryableUpstreamFailure(upstream.status, detail)) {
+        consecutiveFailures += 1;
+        const delay = retryDelayMs(consecutiveFailures);
+        console.warn(`[glm-proxy] [${reqId}] chat upstream ${upstream.status}; failure ${consecutiveFailures}; next ${delay}ms`);
+        if (body && body.stream && CHAT_PANEL_DIAGNOSTICS && shouldShowChatDiagnostic(consecutiveFailures)) {
           if (!res.headersSent) {
             res.writeHead(200, {
               'Content-Type': 'text/event-stream',
@@ -633,21 +675,16 @@ async function proxyChatCompletions(req, res, provider) {
           }
           streamedDiagnostics = true;
           writeChatDiagnosticChunk(res, body, retryDiagnosticText({
-            retry,
-            maxRetries: CHAT_BUSY_RETRY_MAX,
-            delay,
+            failures: consecutiveFailures,
+            delay: CHAT_STEADY_RETRY_DELAY_MS,
             status: upstream.status,
-            detail,
           }));
         }
         await sleep(delay);
         continue;
       }
-      if (isRetryableUpstreamFailure(upstream.status, detail)) {
-        console.warn(`[glm-proxy] [${reqId}] chat upstream ${upstream.status} exhausted after ${attempt} attempts`);
-      }
-      if (res.headersSent || isRetryableUpstreamFailure(upstream.status, detail)) {
-        abortChatAfterRetries(res, upstream.status, detail);
+      if (res.headersSent) {
+        res.destroy(new Error(`upstream ${upstream.status}`));
         return;
       }
       res.writeHead(upstream.status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -689,9 +726,8 @@ async function proxyChatCompletions(req, res, provider) {
     return;
   }
 
-  if (lastFailure) {
-    abortChatAfterRetries(res, lastFailure.status, lastFailure.detail);
-    return;
+  if (lastFailure && !res.destroyed) {
+    console.warn(`[glm-proxy] [${reqId}] chat stopped after client closed with last failure ${lastFailure.status}`);
   }
 }
 
@@ -715,7 +751,9 @@ async function route(req, res) {
       providerName: provider.name,
       models: provider.models,
       retryMax: BUSY_RETRY_MAX,
-      chatRetryMax: CHAT_BUSY_RETRY_MAX,
+      chatRetryMax: null,
+      chatDiagnosticEvery: CHAT_DIAGNOSTIC_EVERY,
+      chatSteadyRetryDelayMs: CHAT_STEADY_RETRY_DELAY_MS,
       upstream: provider.baseUrl,
       chatCompletionsUpstream: provider.chatCompletionsUrl,
     });
