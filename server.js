@@ -69,6 +69,18 @@ function upstreamFailureSummary(status, detail) {
   return `上游返回 ${status}${message ? `：${String(message).slice(0, 180)}` : ''}`;
 }
 
+function upstreamShortReason(detail) {
+  const safeDetail = sanitizeUpstreamDetail(detail);
+  let parsed;
+  try { parsed = safeDetail ? JSON.parse(safeDetail) : null; } catch (_) {}
+  const message = parsed && parsed.error && typeof parsed.error === 'object'
+    ? parsed.error.message || parsed.error.code || safeDetail
+    : parsed && parsed.error
+      ? parsed.error
+      : safeDetail;
+  return String(message || '').replace(/\s+/g, ' ').slice(0, 120);
+}
+
 function chatChunk(body, content, finishReason = null) {
   return {
     id: `chatcmpl_glm_proxy_${Date.now().toString(36)}`,
@@ -88,21 +100,13 @@ function writeChatDiagnosticChunk(res, body, content, finishReason = null) {
 }
 
 function retryDiagnosticText({ attempt, maxAttempts, delay, status, detail }) {
-  return [
-    '',
-    `【代理提示】${upstreamFailureSummary(status, detail)}。`,
-    `正在重试第 ${attempt + 1}/${maxAttempts} 次，约 ${Math.round(delay / 1000)} 秒后继续。`,
-    '',
-  ].join('\n');
+  const reason = upstreamShortReason(detail);
+  return `<small>\`proxy\` · upstream \`${status}\` · retry \`${attempt + 1}/${maxAttempts}\` · next \`${Math.round(delay / 1000)}s\`${reason ? ` · ${reason}` : ''}</small>\n\n`;
 }
 
 function finalDiagnosticText({ attempts, status, detail }) {
-  return [
-    '',
-    `【代理提示】${upstreamFailureSummary(status, detail)}。`,
-    `已重试 ${attempts} 次仍失败，这通常是上游模型服务繁忙或网关异常。`,
-    '可以稍后重新发送，或临时切换模型。',
-  ].join('\n');
+  const reason = upstreamShortReason(detail);
+  return `<small>\`proxy\` · upstream \`${status}\` · failed after \`${attempts}\` retries${reason ? ` · ${reason}` : ''}</small>`;
 }
 
 function sendChatDiagnosticJson(res, body, text) {
