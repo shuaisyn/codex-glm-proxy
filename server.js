@@ -11,11 +11,8 @@ const DEFAULT_PROVIDERS_FILE = path.resolve(__dirname, '..', 'MultiCC', 'provide
 const PROVIDERS_FILE = process.env.MULTICC_PROVIDERS_JSON || DEFAULT_PROVIDERS_FILE;
 const BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_BUSY_RETRY_MAX || '8', 10) || 8);
 const BUSY_RETRY_DELAYS_MS = [250, 600, 1200, 2200, 4000, 6500, 9000];
-const CHAT_BUSY_RETRY_MAX = Math.max(
-  BUSY_RETRY_MAX,
-  parseInt(process.env.XF_CHAT_BUSY_RETRY_MAX || '12', 10) || 12
-);
-const CHAT_BUSY_RETRY_DELAYS_MS = [500, 1000, 2000, 4000, 7000, 10000, 10000, 10000, 10000, 10000, 10000];
+const CHAT_BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_CHAT_BUSY_RETRY_MAX || '5', 10) || 5);
+const CHAT_BUSY_RETRY_DELAYS_MS = [2000, 5000, 10000, 20000];
 const CHAT_PANEL_DIAGNOSTICS = process.env.XF_CHAT_PANEL_DIAGNOSTICS !== '0';
 const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 const DEFAULT_CODEX_MODEL_CATALOG = path.join(
@@ -57,30 +54,6 @@ function isRetryableUpstreamFailure(status, detail) {
   return RETRYABLE_HTTP_STATUSES.has(Number(status)) || isTransientXfBusy(detail);
 }
 
-function upstreamFailureSummary(status, detail) {
-  const safeDetail = sanitizeUpstreamDetail(detail);
-  let parsed;
-  try { parsed = safeDetail ? JSON.parse(safeDetail) : null; } catch (_) {}
-  const message = parsed && parsed.error && typeof parsed.error === 'object'
-    ? parsed.error.message || parsed.error.code || safeDetail
-    : parsed && parsed.error
-      ? parsed.error
-      : safeDetail;
-  return `上游返回 ${status}${message ? `：${String(message).slice(0, 180)}` : ''}`;
-}
-
-function upstreamShortReason(detail) {
-  const safeDetail = sanitizeUpstreamDetail(detail);
-  let parsed;
-  try { parsed = safeDetail ? JSON.parse(safeDetail) : null; } catch (_) {}
-  const message = parsed && parsed.error && typeof parsed.error === 'object'
-    ? parsed.error.message || parsed.error.code || safeDetail
-    : parsed && parsed.error
-      ? parsed.error
-      : safeDetail;
-  return String(message || '').replace(/\s+/g, ' ').slice(0, 120);
-}
-
 function chatChunk(body, content, finishReason = null) {
   return {
     id: `chatcmpl_glm_proxy_${Date.now().toString(36)}`,
@@ -103,23 +76,13 @@ function retryDiagnosticText({ attempt, maxAttempts, delay, status }) {
   return `\`proxy retry · ${status} · ${attempt + 1}/${maxAttempts} · next ${Math.round(delay / 1000)}s\`\n\n`;
 }
 
-function finalDiagnosticText({ attempts, status }) {
-  return `\`proxy failed · ${status} · after ${attempts} retries\``;
-}
-
-function sendChatDiagnosticJson(res, body, text) {
-  const payload = {
-    id: `chatcmpl_glm_proxy_${Date.now().toString(36)}`,
-    object: 'chat.completion',
-    created: Math.floor(Date.now() / 1000),
-    model: body && body.model || 'unknown',
-    choices: [{
-      index: 0,
-      message: { role: 'assistant', content: text.trim() },
-      finish_reason: 'stop',
-    }],
-  };
-  json(res, 200, payload);
+function abortChatAfterRetries(res, status, detail) {
+  const message = `upstream ${status} after retries: ${sanitizeUpstreamDetail(detail)}`;
+  if (res.headersSent) {
+    res.destroy(new Error(message));
+    return;
+  }
+  json(res, status, { error: message });
 }
 
 function providerList(raw) {
@@ -648,25 +611,7 @@ async function proxyChatCompletions(req, res, provider) {
         await sleep(delay);
         continue;
       }
-      if (body && body.stream && CHAT_PANEL_DIAGNOSTICS) {
-        if (!res.headersSent) {
-          res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            Connection: 'keep-alive',
-          });
-        }
-        writeChatDiagnosticChunk(res, body, finalDiagnosticText({ attempts: attempt, status: 502, detail }));
-        writeChatDiagnosticChunk(res, body, '', 'stop');
-        res.write('data: [DONE]\n\n');
-        res.end();
-        return;
-      }
-      if (CHAT_PANEL_DIAGNOSTICS) {
-        sendChatDiagnosticJson(res, body, finalDiagnosticText({ attempts: attempt, status: 502, detail }));
-        return;
-      }
-      json(res, 502, { error: detail });
+      abortChatAfterRetries(res, 502, detail);
       return;
     }
 
@@ -700,22 +645,8 @@ async function proxyChatCompletions(req, res, provider) {
       if (isRetryableUpstreamFailure(upstream.status, detail)) {
         console.warn(`[glm-proxy] [${reqId}] chat upstream ${upstream.status} exhausted after ${attempt} attempts`);
       }
-      if (body && body.stream && CHAT_PANEL_DIAGNOSTICS && (res.headersSent || isRetryableUpstreamFailure(upstream.status, detail))) {
-        if (!res.headersSent) {
-          res.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            Connection: 'keep-alive',
-          });
-        }
-        writeChatDiagnosticChunk(res, body, finalDiagnosticText({ attempts: attempt, status: upstream.status, detail }));
-        writeChatDiagnosticChunk(res, body, '', 'stop');
-        res.write('data: [DONE]\n\n');
-        res.end();
-        return;
-      }
-      if (CHAT_PANEL_DIAGNOSTICS && isRetryableUpstreamFailure(upstream.status, detail)) {
-        sendChatDiagnosticJson(res, body, finalDiagnosticText({ attempts: attempt, status: upstream.status, detail }));
+      if (res.headersSent || isRetryableUpstreamFailure(upstream.status, detail)) {
+        abortChatAfterRetries(res, upstream.status, detail);
         return;
       }
       res.writeHead(upstream.status, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -757,12 +688,8 @@ async function proxyChatCompletions(req, res, provider) {
     return;
   }
 
-  if (!res.headersSent && CHAT_PANEL_DIAGNOSTICS && lastFailure) {
-    sendChatDiagnosticJson(res, body, finalDiagnosticText({
-      attempts: CHAT_BUSY_RETRY_MAX,
-      status: lastFailure.status,
-      detail: lastFailure.detail,
-    }));
+  if (lastFailure) {
+    abortChatAfterRetries(res, lastFailure.status, lastFailure.detail);
     return;
   }
 }
