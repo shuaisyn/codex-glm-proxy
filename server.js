@@ -11,6 +11,11 @@ const DEFAULT_PROVIDERS_FILE = path.resolve(__dirname, '..', 'MultiCC', 'provide
 const PROVIDERS_FILE = process.env.MULTICC_PROVIDERS_JSON || DEFAULT_PROVIDERS_FILE;
 const BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_BUSY_RETRY_MAX || '8', 10) || 8);
 const BUSY_RETRY_DELAYS_MS = [250, 600, 1200, 2200, 4000, 6500, 9000];
+const CHAT_BUSY_RETRY_MAX = Math.max(
+  BUSY_RETRY_MAX,
+  parseInt(process.env.XF_CHAT_BUSY_RETRY_MAX || '12', 10) || 12
+);
+const CHAT_BUSY_RETRY_DELAYS_MS = [500, 1000, 2000, 4000, 7000, 10000, 10000, 10000, 10000, 10000, 10000];
 const DEFAULT_CODEX_MODEL_CATALOG = path.join(
   process.env.USERPROFILE || process.env.HOME || '',
   '.codex',
@@ -539,11 +544,14 @@ async function proxyChatCompletions(req, res, provider) {
     if (!upstream.ok) {
       let detail = '';
       try { detail = await upstream.text(); } catch (_) {}
-      if (isTransientXfBusy(detail) && attempt < BUSY_RETRY_MAX) {
-        const delay = BUSY_RETRY_DELAYS_MS[Math.min(attempt - 1, BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
-        console.warn(`[glm-proxy] [${reqId}] chat upstream busy; retrying ${attempt + 1}/${BUSY_RETRY_MAX}`);
+      if (isTransientXfBusy(detail) && attempt < CHAT_BUSY_RETRY_MAX) {
+        const delay = CHAT_BUSY_RETRY_DELAYS_MS[Math.min(attempt - 1, CHAT_BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
+        console.warn(`[glm-proxy] [${reqId}] chat upstream busy; retrying ${attempt + 1}/${CHAT_BUSY_RETRY_MAX}`);
         await sleep(delay);
         continue;
+      }
+      if (isTransientXfBusy(detail)) {
+        console.warn(`[glm-proxy] [${reqId}] chat upstream busy exhausted after ${attempt} attempts`);
       }
       res.writeHead(upstream.status, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(detail || JSON.stringify({ error: `upstream ${upstream.status}` }));
@@ -602,6 +610,7 @@ async function route(req, res) {
       providerName: provider.name,
       models: provider.models,
       retryMax: BUSY_RETRY_MAX,
+      chatRetryMax: CHAT_BUSY_RETRY_MAX,
       upstream: provider.baseUrl,
       chatCompletionsUpstream: provider.chatCompletionsUrl,
     });
