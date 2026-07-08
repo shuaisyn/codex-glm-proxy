@@ -99,14 +99,12 @@ function writeChatDiagnosticChunk(res, body, content, finishReason = null) {
   res.write(`data: ${JSON.stringify(chatChunk(body, content, finishReason))}\n\n`);
 }
 
-function retryDiagnosticText({ attempt, maxAttempts, delay, status, detail }) {
-  const reason = upstreamShortReason(detail);
-  return `<small>\`proxy\` · upstream \`${status}\` · retry \`${attempt + 1}/${maxAttempts}\` · next \`${Math.round(delay / 1000)}s\`${reason ? ` · ${reason}` : ''}</small>\n\n`;
+function retryDiagnosticText({ attempt, maxAttempts, delay, status }) {
+  return `\`proxy retry · ${status} · ${attempt + 1}/${maxAttempts} · next ${Math.round(delay / 1000)}s\`\n\n`;
 }
 
-function finalDiagnosticText({ attempts, status, detail }) {
-  const reason = upstreamShortReason(detail);
-  return `<small>\`proxy\` · upstream \`${status}\` · failed after \`${attempts}\` retries${reason ? ` · ${reason}` : ''}</small>`;
+function finalDiagnosticText({ attempts, status }) {
+  return `\`proxy failed · ${status} · after ${attempts} retries\``;
 }
 
 function sendChatDiagnosticJson(res, body, text) {
