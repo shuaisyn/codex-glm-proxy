@@ -12,7 +12,7 @@ const PROVIDERS_FILE = process.env.MULTICC_PROVIDERS_JSON || DEFAULT_PROVIDERS_F
 const BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_BUSY_RETRY_MAX || '8', 10) || 8);
 const BUSY_RETRY_DELAYS_MS = [250, 600, 1200, 2200, 4000, 6500, 9000];
 const CHAT_BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_CHAT_BUSY_RETRY_MAX || '5', 10) || 5);
-const CHAT_BUSY_RETRY_DELAYS_MS = [2000, 5000, 10000, 20000];
+const CHAT_BUSY_RETRY_DELAYS_MS = [2000, 5000, 10000, 20000, 30000];
 const CHAT_PANEL_DIAGNOSTICS = process.env.XF_CHAT_PANEL_DIAGNOSTICS !== '0';
 const RETRYABLE_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
 const DEFAULT_CODEX_MODEL_CATALOG = path.join(
@@ -72,8 +72,8 @@ function writeChatDiagnosticChunk(res, body, content, finishReason = null) {
   res.write(`data: ${JSON.stringify(chatChunk(body, content, finishReason))}\n\n`);
 }
 
-function retryDiagnosticText({ attempt, maxAttempts, delay, status }) {
-  return `\`proxy retry · ${status} · ${attempt + 1}/${maxAttempts} · next ${Math.round(delay / 1000)}s\`\n\n`;
+function retryDiagnosticText({ retry, maxRetries, delay, status }) {
+  return `\`proxy retry · ${status} · ${retry}/${maxRetries} · next ${Math.round(delay / 1000)}s\`\n\n`;
 }
 
 function abortChatAfterRetries(res, status, detail) {
@@ -573,7 +573,8 @@ async function proxyChatCompletions(req, res, provider) {
   let streamedDiagnostics = false;
   let lastFailure = null;
 
-  for (let attempt = 1; attempt <= CHAT_BUSY_RETRY_MAX; attempt++) {
+  for (let attempt = 1; attempt <= CHAT_BUSY_RETRY_MAX + 1; attempt++) {
+    const retry = attempt;
     let upstream;
     try {
       upstream = await fetch(provider.chatCompletionsUrl, {
@@ -588,9 +589,9 @@ async function proxyChatCompletions(req, res, provider) {
     } catch (e) {
       const detail = `fetch upstream failed: ${e && e.message ? e.message : String(e)}`;
       lastFailure = { status: 502, detail };
-      if (attempt < CHAT_BUSY_RETRY_MAX) {
-        const delay = CHAT_BUSY_RETRY_DELAYS_MS[Math.min(attempt - 1, CHAT_BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
-        console.warn(`[glm-proxy] [${reqId}] chat upstream fetch failed; retrying ${attempt + 1}/${CHAT_BUSY_RETRY_MAX}`);
+      if (retry <= CHAT_BUSY_RETRY_MAX) {
+        const delay = CHAT_BUSY_RETRY_DELAYS_MS[Math.min(retry - 1, CHAT_BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
+        console.warn(`[glm-proxy] [${reqId}] chat upstream fetch failed; retrying ${retry}/${CHAT_BUSY_RETRY_MAX}`);
         if (body && body.stream && CHAT_PANEL_DIAGNOSTICS) {
           if (!res.headersSent) {
             res.writeHead(200, {
@@ -601,8 +602,8 @@ async function proxyChatCompletions(req, res, provider) {
           }
           streamedDiagnostics = true;
           writeChatDiagnosticChunk(res, body, retryDiagnosticText({
-            attempt,
-            maxAttempts: CHAT_BUSY_RETRY_MAX,
+            retry,
+            maxRetries: CHAT_BUSY_RETRY_MAX,
             delay,
             status: 502,
             detail,
@@ -619,9 +620,9 @@ async function proxyChatCompletions(req, res, provider) {
       let detail = '';
       try { detail = await upstream.text(); } catch (_) {}
       lastFailure = { status: upstream.status, detail };
-      if (isRetryableUpstreamFailure(upstream.status, detail) && attempt < CHAT_BUSY_RETRY_MAX) {
-        const delay = CHAT_BUSY_RETRY_DELAYS_MS[Math.min(attempt - 1, CHAT_BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
-        console.warn(`[glm-proxy] [${reqId}] chat upstream ${upstream.status}; retrying ${attempt + 1}/${CHAT_BUSY_RETRY_MAX}`);
+      if (isRetryableUpstreamFailure(upstream.status, detail) && retry <= CHAT_BUSY_RETRY_MAX) {
+        const delay = CHAT_BUSY_RETRY_DELAYS_MS[Math.min(retry - 1, CHAT_BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
+        console.warn(`[glm-proxy] [${reqId}] chat upstream ${upstream.status}; retrying ${retry}/${CHAT_BUSY_RETRY_MAX}`);
         if (body && body.stream && CHAT_PANEL_DIAGNOSTICS) {
           if (!res.headersSent) {
             res.writeHead(200, {
@@ -632,8 +633,8 @@ async function proxyChatCompletions(req, res, provider) {
           }
           streamedDiagnostics = true;
           writeChatDiagnosticChunk(res, body, retryDiagnosticText({
-            attempt,
-            maxAttempts: CHAT_BUSY_RETRY_MAX,
+            retry,
+            maxRetries: CHAT_BUSY_RETRY_MAX,
             delay,
             status: upstream.status,
             detail,
