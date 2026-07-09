@@ -19,8 +19,13 @@ const MAX_JSON_BODY_BYTES = Math.max(
   parseInt(process.env.XF_MAX_JSON_BODY_BYTES || process.env.XF_MAX_REQUEST_BYTES || '2097152', 10) || 2097152
 );
 const UPSTREAM_TIMEOUT_MS = Math.max(3000, parseInt(process.env.XF_UPSTREAM_TIMEOUT_MS || '30000', 10) || 30000);
-const BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_BUSY_RETRY_MAX || '8', 10) || 8);
+const MAAS_API_KEY = process.env.XF_MAAS_API_KEY || '';
+const RESPONSES_BUSY_RETRY_MAX = Math.max(
+  1,
+  parseInt(process.env.XF_BUSY_RETRY_MAX || process.env.XF_RESPONSES_BUSY_RETRY_MAX || '8', 10) || 8
+);
 const BUSY_RETRY_DELAYS_MS = [250, 600, 1200, 2200, 4000, 6500, 9000];
+const RESPONSES_TOTAL_ATTEMPTS = RESPONSES_BUSY_RETRY_MAX + 1;
 const CHAT_DIAGNOSTIC_EVERY = Math.max(1, parseInt(process.env.XF_CHAT_DIAGNOSTIC_EVERY || '5', 10) || 5);
 const CHAT_BUSY_RETRY_DELAYS_MS = [2000, 5000, 10000, 15000];
 const CHAT_BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_CHAT_BUSY_RETRY_MAX || '5', 10) || 5);
@@ -51,6 +56,10 @@ const CHAT_TOTAL_ATTEMPTS = CHAT_BUSY_RETRY_MAX + 1;
 
 let requestSeq = 0;
 let codexModelCatalogBySlug = null;
+
+function canRetryAfterFailure(failures, maxFailures) {
+  return failures <= maxFailures;
+}
 
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -252,7 +261,7 @@ function readProvider(providerId = DEFAULT_PROVIDER_ID) {
     ? provider.settingsConfig
     : {};
   const target = cfg.proxyTarget || {};
-  const apiKey = target.apiKey || provider.authToken || cfg.auth?.OPENAI_API_KEY || process.env.XF_MAAS_API_KEY || '';
+  const apiKey = MAAS_API_KEY;
   const baseUrl = target.baseUrl
     || process.env.XF_MAAS_RESPONSES_URL
     || 'https://maas-coding-api.cn-huabei-1.xf-yun.com/v1/responses';
@@ -260,7 +269,16 @@ function readProvider(providerId = DEFAULT_PROVIDER_ID) {
     || process.env.XF_MAAS_CHAT_COMPLETIONS_URL
     || 'https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions';
 
-  if (!apiKey) throw new Error(`provider has no local api key: ${providerId}`);
+  if (!apiKey) {
+    const hasLocalKey = Boolean(target.apiKey || provider.authToken || cfg.auth?.OPENAI_API_KEY);
+    if (hasLocalKey) {
+      throw new Error(`provider ${providerId} has no env api key: set XF_MAAS_API_KEY for secret injection`);
+    }
+    throw new Error(`provider ${providerId} has no api key`);
+  }
+  if (target.apiKey || provider.authToken || cfg.auth?.OPENAI_API_KEY) {
+    console.warn(`[glm-proxy] [${providerId}] provider config contains api key fields, but XF_MAAS_API_KEY is used for authentication`);
+  }
 
   return {
     id: provider.id || providerId,
@@ -536,7 +554,8 @@ async function proxyResponses(req, res, provider) {
 
   setSseHeaders(res);
 
-  for (let attempt = 1; attempt <= BUSY_RETRY_MAX; attempt++) {
+  let consecutiveFailures = 0;
+  for (let attempt = 1; attempt <= RESPONSES_TOTAL_ATTEMPTS; attempt++) {
     const stats = {
       attempt,
       events: 0,
@@ -578,8 +597,16 @@ async function proxyResponses(req, res, provider) {
     } catch (e) {
       upstreamTimer.clear();
       if (currentAborter === aborter) currentAborter = null;
-      sendFailed(res, sanitizeErrorText(`fetch upstream failed: ${e && e.message ? e.message : String(e)}`));
-      return;
+      consecutiveFailures += 1;
+      const message = sanitizeErrorText(`fetch upstream failed: ${e && e.message ? e.message : String(e)}`);
+      if (!canRetryAfterFailure(consecutiveFailures, RESPONSES_BUSY_RETRY_MAX)) {
+        sendFailed(res, message);
+        return;
+      }
+      const delay = BUSY_RETRY_DELAYS_MS[Math.min(consecutiveFailures - 1, BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
+      console.warn(`[glm-proxy] [${reqId}] responses upstream fetch failed; failure ${consecutiveFailures}; next ${delay}ms`);
+      await sleep(delay);
+      continue;
     }
 
     if (!upstream.ok || !upstream.body) {
@@ -635,9 +662,13 @@ async function proxyResponses(req, res, provider) {
 
           if (state.sawOutput || state.completed) commit();
           if (state.failed) {
-            if (!committed && !state.sawOutput && isTransientXfBusy(stats.failedMessage) && attempt < BUSY_RETRY_MAX) {
-              retryBusy = true;
-              stats.busyRetry = true;
+            if (!committed && !state.sawOutput && isTransientXfBusy(stats.failedMessage)) {
+              consecutiveFailures += 1;
+              retryBusy = canRetryAfterFailure(consecutiveFailures, RESPONSES_BUSY_RETRY_MAX);
+              stats.busyRetry = retryBusy;
+              if (!retryBusy) {
+                commit();
+              }
             } else {
               commit();
             }
@@ -664,8 +695,8 @@ async function proxyResponses(req, res, provider) {
       }
 
       if (retryBusy) {
-        console.warn(`[glm-proxy] [${reqId}] upstream busy; retrying ${attempt + 1}/${BUSY_RETRY_MAX}: ${stats.failedMessage}`);
-        const delay = BUSY_RETRY_DELAYS_MS[Math.min(attempt - 1, BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
+        console.warn(`[glm-proxy] [${reqId}] responses upstream busy; retrying ${attempt + 1}/${RESPONSES_TOTAL_ATTEMPTS}: ${stats.failedMessage}`);
+        const delay = BUSY_RETRY_DELAYS_MS[Math.min(consecutiveFailures - 1, BUSY_RETRY_DELAYS_MS.length - 1)] || 1000;
         await sleep(delay);
         continue;
       }
@@ -691,7 +722,7 @@ async function proxyResponses(req, res, provider) {
         commit();
         res.write(`\n\nevent: response.failed\ndata: ${JSON.stringify({
           type: 'response.failed',
-          response: { status: 'failed', error: { message: `stream error: ${e && e.message ? e.message : String(e)}` } },
+          response: { status: 'failed', error: { message: `stream error: ${sanitizeErrorText(e && e.message ? e.message : String(e))}` } },
         })}\n\n`);
       }
     } finally {
@@ -776,7 +807,7 @@ async function proxyChatCompletions(req, res, provider) {
       currentAborter = null;
       lastFailure = { status: 502, detail };
       consecutiveFailures += 1;
-      if (consecutiveFailures > CHAT_BUSY_RETRY_MAX) {
+      if (!canRetryAfterFailure(consecutiveFailures, CHAT_BUSY_RETRY_MAX)) {
         console.warn(`[glm-proxy] [${reqId}] chat upstream fetch failed; failure ${consecutiveFailures}; reached retry limit ${CHAT_BUSY_RETRY_MAX}`);
         writeChatRetryExhausted(res, body, consecutiveFailures, 502);
         return;
@@ -810,7 +841,7 @@ async function proxyChatCompletions(req, res, provider) {
       lastFailure = { status: upstream.status, detail: sanitizeErrorText(detail) };
       if (isRetryableUpstreamFailure(upstream.status, detail)) {
         consecutiveFailures += 1;
-        if (consecutiveFailures > CHAT_BUSY_RETRY_MAX) {
+        if (!canRetryAfterFailure(consecutiveFailures, CHAT_BUSY_RETRY_MAX)) {
           console.warn(`[glm-proxy] [${reqId}] chat upstream ${upstream.status}; failure ${consecutiveFailures}; reached retry limit ${CHAT_BUSY_RETRY_MAX}`);
           writeChatRetryExhausted(res, body, consecutiveFailures, upstream.status);
           return;
@@ -896,8 +927,9 @@ async function route(req, res) {
   try {
     provider = readProvider(providerId);
   } catch (e) {
-    if (url.pathname === '/health') json(res, 503, { ok: false, error: e.message });
-    else json(res, 500, { error: e.message });
+    const errorMessage = sanitizeErrorText(e && e.message ? e.message : String(e));
+    if (url.pathname === '/health') json(res, 503, { ok: false, error: errorMessage });
+    else json(res, 500, { error: errorMessage });
     return;
   }
 
@@ -908,7 +940,8 @@ async function route(req, res) {
       providerName: provider.name,
       models: provider.models,
       version: PACKAGE_VERSION,
-      retryMax: BUSY_RETRY_MAX,
+      retryMax: RESPONSES_BUSY_RETRY_MAX,
+      responsesRetryMax: RESPONSES_BUSY_RETRY_MAX,
       chatRetryMax: CHAT_BUSY_RETRY_MAX,
       chatRetryMaxAttempts: CHAT_TOTAL_ATTEMPTS,
       chatDiagnosticEvery: CHAT_DIAGNOSTIC_EVERY,
@@ -943,7 +976,7 @@ async function route(req, res) {
 }
 
 const server = http.createServer((req, res) => {
-  route(req, res).catch(e => json(res, 500, { error: e && e.message ? e.message : String(e) }));
+  route(req, res).catch(e => json(res, 500, { error: sanitizeErrorText(e && e.message ? e.message : String(e)) }));
 });
 
 server.listen(PORT, '127.0.0.1', () => {

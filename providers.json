@@ -6,8 +6,7 @@
                           "settingsConfig":  {
                                                  "proxyTarget":  {
                                                                      "baseUrl":  "https://maas-coding-api.cn-huabei-1.xf-yun.com/v1/responses",
-                                                                     "chatCompletionsUrl":  "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
-                                                                     "apiKey":  "fb661d6aac6bbe84e20c8fa1b989fda3:YmNlZjAxZDc5ZjExMGY1NTFhODNlNTNi"
+                                                                     "chatCompletionsUrl":  "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions"
                                                                  },
                                                  "modelCatalog":  {
                                                                       "models":  [

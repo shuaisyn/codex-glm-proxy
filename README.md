@@ -6,7 +6,7 @@
 
 - 提供 `http://127.0.0.1:3017/v1/responses` 给 Codex 使用。
 - 提供 `http://127.0.0.1:3017/v1/chat/completions` 给 AionUI/OpenAI 兼容客户端使用。
-- 从仓库根目录的 `providers.json` 读取本地讯飞 MaaS provider 配置和密钥。
+- 从仓库根目录的 `providers.json` 读取本地讯飞 MaaS provider 配置（API Key 建议通过环境变量注入）。
 - 也可用 `GLM_PROVIDERS_JSON` / `XF_PROVIDERS_JSON` / `MULTICC_PROVIDERS_JSON` 覆盖。
 - 不复制、不打印、不提交密钥。
 - 对讯飞 `10012 / EngineInternalError:1105 / system busy` 做代理层重试。
@@ -58,14 +58,14 @@
 - `GLM_PROVIDERS_JSON`
 - `XF_PROVIDERS_JSON`
 - `MULTICC_PROVIDERS_JSON`
-- `XF_BUSY_RETRY_MAX`
-- `XF_CHAT_BUSY_RETRY_MAX`：chat/completions 最多重试次数（`/health` 中 `chatRetryMax` 显示）。
+- `XF_BUSY_RETRY_MAX`：`/v1/responses` 最多重试次数（`/health` 中 `responsesRetryMax` 显示）。
+- `XF_CHAT_BUSY_RETRY_MAX`：`/v1/chat/completions` 最多重试次数（`/health` 中 `chatRetryMax` 显示）。
 - `XF_CHAT_DIAGNOSTIC_EVERY`：每多少次失败在 AionUI 面板打印一次重试提示。
 - `XF_CHAT_STEADY_RETRY_DELAY_MS`：`chat/completions` 持续重试间隔。
 - `XF_UPSTREAM_TIMEOUT_MS`：上游请求超时（默认按 profile 下发）。
 - `XF_MAX_JSON_BODY_BYTES`：请求体最大字节数（默认按 profile 下发）。
 - `XF_CHAT_PANEL_DIAGNOSTICS`：默认开启；设为 `0` 可关闭 AionUI 面板里的代理诊断提示。
-- `XF_MAAS_API_KEY`
+- `XF_MAAS_API_KEY`：优先用于认证，优先级高于 `providers.json` 内的 key 字段；建议在环境变量中配置（不建议在文件中明文放置 key）。
 - `XF_MAAS_RESPONSES_URL`
 - `XF_MAAS_CHAT_COMPLETIONS_URL`
 

@@ -37,6 +37,7 @@ switch ($Profile) {
   "version1" {
     # 兼容版：参数偏保守，兼顾上手体验
     Set-EnvIfMissing -Name "XF_CHAT_BUSY_RETRY_MAX" -Value "5"
+    Set-EnvIfMissing -Name "XF_BUSY_RETRY_MAX" -Value "5"
     Set-EnvIfMissing -Name "XF_CHAT_STEADY_RETRY_DELAY_MS" -Value "10000"
     Set-EnvIfMissing -Name "XF_CHAT_DIAGNOSTIC_EVERY" -Value "5"
     Set-EnvIfMissing -Name "XF_UPSTREAM_TIMEOUT_MS" -Value "25000"
@@ -46,6 +47,7 @@ switch ($Profile) {
   "version2" {
     # 稳健版：更偏向高可用与观测
     Set-EnvIfMissing -Name "XF_CHAT_BUSY_RETRY_MAX" -Value "7"
+    Set-EnvIfMissing -Name "XF_BUSY_RETRY_MAX" -Value "7"
     Set-EnvIfMissing -Name "XF_CHAT_DIAGNOSTIC_EVERY" -Value "3"
     Set-EnvIfMissing -Name "XF_CHAT_STEADY_RETRY_DELAY_MS" -Value "8000"
     Set-EnvIfMissing -Name "XF_UPSTREAM_TIMEOUT_MS" -Value "35000"
@@ -62,7 +64,7 @@ if (-not [string]::IsNullOrWhiteSpace($ProvidersFile)) {
 
 Write-Output "start-proxy profile=$Profile port=$Port provider=$ProviderId"
 Write-Output "read providers: $env:GLM_PROVIDERS_JSON"
-Write-Output "chat retry max: $env:XF_CHAT_BUSY_RETRY_MAX, stable delay: $env:XF_CHAT_STEADY_RETRY_DELAY_MS, upstream timeout: $env:XF_UPSTREAM_TIMEOUT_MS"
+Write-Output "responses retry max: $env:XF_BUSY_RETRY_MAX, chat retry max: $env:XF_CHAT_BUSY_RETRY_MAX, stable delay: $env:XF_CHAT_STEADY_RETRY_DELAY_MS, upstream timeout: $env:XF_UPSTREAM_TIMEOUT_MS"
 
 $LogDir = Join-Path $Root "logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
