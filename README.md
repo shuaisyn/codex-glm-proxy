@@ -46,7 +46,8 @@
 - `XF_PROVIDER_ID`
 - `MULTICC_PROVIDERS_JSON`
 - `XF_BUSY_RETRY_MAX`
-- `XF_CHAT_BUSY_RETRY_MAX`：chat/completions 默认最多重试 5 次。
+- `XF_CHAT_BUSY_RETRY_MAX`：chat/completions 默认最多重试 5 次（`/health` 中 `chatRetryMax` 显示）。
+- `XF_CHAT_STEADY_RETRY_DELAY_MS`：`chat/completions` 从第 5 次连续失败后的稳定重试间隔（默认 15000ms）。
 - `XF_CHAT_PANEL_DIAGNOSTICS`：默认开启；设为 `0` 可关闭 AionUI 面板里的代理诊断提示。
 - `XF_MAAS_API_KEY`
 - `XF_MAAS_RESPONSES_URL`
