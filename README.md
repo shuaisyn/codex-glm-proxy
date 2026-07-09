@@ -6,7 +6,8 @@
 
 - 提供 `http://127.0.0.1:3017/v1/responses` 给 Codex 使用。
 - 提供 `http://127.0.0.1:3017/v1/chat/completions` 给 AionUI/OpenAI 兼容客户端使用。
-- 从仓库根目录的 `providers.json` 读取本地讯飞 MaaS provider 配置和密钥（可用 `MULTICC_PROVIDERS_JSON` 覆盖）。
+- 从仓库根目录的 `providers.json` 读取本地讯飞 MaaS provider 配置和密钥。
+- 也可用 `GLM_PROVIDERS_JSON` / `XF_PROVIDERS_JSON` / `MULTICC_PROVIDERS_JSON` 覆盖。
 - 不复制、不打印、不提交密钥。
 - 对讯飞 `10012 / EngineInternalError:1105 / system busy` 做代理层重试。
 - AionUI 使用 `/v1/chat/completions` 流式调用时，上游 408/429/500/502/503/504 或忙碌错误会直接在会话面板里显示代理重试提示；默认最多重试 5 次，只有连续重试仍拿不到有效上游响应时才中断本次流式请求，让用户重新发送。
@@ -14,10 +15,20 @@
 
 ## 常用命令
 
-启动代理：
+启动代理（默认 version1）：
 
 ```powershell
 .\start-proxy.ps1
+```
+
+可选切换参数（两种优化方案）：
+
+```powershell
+# 兼容版（默认）：更偏向稳定，重试更保守
+.\start-proxy.ps1 -Profile version1
+
+# 稳健版：更偏向可用性，重试更积极/更长超时
+.\start-proxy.ps1 -Profile version2
 ```
 
 调用 GLM-5.2 最高档：
@@ -38,17 +49,21 @@
 
 - 端口：`3017`
 - provider：`5672307d-a380-433f-9a28-23c6b2ba95ea`
-- provider 配置：`..\MultiCC\providers.json`
+- provider 配置：`.\providers.json`
 
 可用环境变量覆盖：
 
 - `GLM_PROXY_PORT`
 - `XF_PROVIDER_ID`
+- `GLM_PROVIDERS_JSON`
+- `XF_PROVIDERS_JSON`
 - `MULTICC_PROVIDERS_JSON`
 - `XF_BUSY_RETRY_MAX`
-- `XF_CHAT_BUSY_RETRY_MAX`：chat/completions 默认最多重试 5 次（`/health` 中 `chatRetryMax` 显示）。
-- `XF_CHAT_STEADY_RETRY_DELAY_MS`：`chat/completions` 从第 5 次连续失败后的稳定重试间隔（默认 15000ms）。
-- 启动脚本 `start-proxy.ps1` 内置推荐值：`XF_CHAT_BUSY_RETRY_MAX=5`，`XF_CHAT_STEADY_RETRY_DELAY_MS=10000`。
+- `XF_CHAT_BUSY_RETRY_MAX`：chat/completions 最多重试次数（`/health` 中 `chatRetryMax` 显示）。
+- `XF_CHAT_DIAGNOSTIC_EVERY`：每多少次失败在 AionUI 面板打印一次重试提示。
+- `XF_CHAT_STEADY_RETRY_DELAY_MS`：`chat/completions` 持续重试间隔。
+- `XF_UPSTREAM_TIMEOUT_MS`：上游请求超时（默认按 profile 下发）。
+- `XF_MAX_JSON_BODY_BYTES`：请求体最大字节数（默认按 profile 下发）。
 - `XF_CHAT_PANEL_DIAGNOSTICS`：默认开启；设为 `0` 可关闭 AionUI 面板里的代理诊断提示。
 - `XF_MAAS_API_KEY`
 - `XF_MAAS_RESPONSES_URL`

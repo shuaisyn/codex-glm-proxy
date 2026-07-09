@@ -8,7 +8,17 @@ const { StringDecoder } = require('string_decoder');
 const PORT = Math.max(1, parseInt(process.env.GLM_PROXY_PORT || '3017', 10) || 3017);
 const DEFAULT_PROVIDER_ID = process.env.XF_PROVIDER_ID || '5672307d-a380-433f-9a28-23c6b2ba95ea';
 const DEFAULT_PROVIDERS_FILE = path.resolve(__dirname, 'providers.json');
-const PROVIDERS_FILE = process.env.MULTICC_PROVIDERS_JSON || DEFAULT_PROVIDERS_FILE;
+const PROVIDERS_FILE = path.resolve(
+  process.env.GLM_PROVIDERS_JSON
+  || process.env.XF_PROVIDERS_JSON
+  || process.env.MULTICC_PROVIDERS_JSON
+  || DEFAULT_PROVIDERS_FILE
+);
+const MAX_JSON_BODY_BYTES = Math.max(
+  1024,
+  parseInt(process.env.XF_MAX_JSON_BODY_BYTES || process.env.XF_MAX_REQUEST_BYTES || '2097152', 10) || 2097152
+);
+const UPSTREAM_TIMEOUT_MS = Math.max(3000, parseInt(process.env.XF_UPSTREAM_TIMEOUT_MS || '30000', 10) || 30000);
 const BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_BUSY_RETRY_MAX || '8', 10) || 8);
 const BUSY_RETRY_DELAYS_MS = [250, 600, 1200, 2200, 4000, 6500, 9000];
 const CHAT_DIAGNOSTIC_EVERY = Math.max(1, parseInt(process.env.XF_CHAT_DIAGNOSTIC_EVERY || '5', 10) || 5);
@@ -28,6 +38,16 @@ const DEFAULT_CODEX_MODEL_CATALOG = path.join(
   'maas-xf-only-models.json'
 );
 const CODEX_MODEL_CATALOG = process.env.CODEX_GLM_MODEL_CATALOG || DEFAULT_CODEX_MODEL_CATALOG;
+const PACKAGE_VERSION = (() => {
+  try {
+    const rawPkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json'), 'utf8'));
+    return String(rawPkg.version || '0.0.0');
+  } catch (_) {
+    return '0.0.0';
+  }
+})();
+const STARTED_AT = Date.now();
+const CHAT_TOTAL_ATTEMPTS = CHAT_BUSY_RETRY_MAX + 1;
 
 let requestSeq = 0;
 let codexModelCatalogBySlug = null;
@@ -43,6 +63,15 @@ function json(res, status, body) {
     'Content-Length': Buffer.byteLength(text),
   });
   res.end(text);
+}
+
+function sanitizeErrorText(value, maxLen = 1200) {
+  if (value == null) return '';
+  const text = String(value);
+  return text
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer ***')
+    .replace(/(")?api[_-]?key(")?\s*[:=]\s*"[A-Za-z0-9._-]+"/gi, '"apiKey":"***"')
+    .slice(0, maxLen);
 }
 
 function isTransientXfBusy(message) {
@@ -348,16 +377,70 @@ function sendFailed(res, message) {
   setSseHeaders(res);
   res.write(`event: response.failed\ndata: ${JSON.stringify({
     type: 'response.failed',
-    response: { status: 'failed', error: { message } },
+    response: { status: 'failed', error: { message: sanitizeErrorText(message) } },
   })}\n\n`);
   try { res.end(); } catch (_) {}
 }
 
 async function readJsonBody(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  const contentLength = parseInt(req.headers['content-length'] || '', 10);
+  if (Number.isFinite(contentLength) && contentLength > MAX_JSON_BODY_BYTES) {
+    const err = new Error(`request body too large: ${contentLength} > ${MAX_JSON_BODY_BYTES}`);
+    err.code = 'PAYLOAD_TOO_LARGE';
+    throw err;
+  }
+
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    total += buf.length;
+    if (total > MAX_JSON_BODY_BYTES) {
+      const err = new Error(`request body too large: ${total} > ${MAX_JSON_BODY_BYTES}`);
+      err.code = 'PAYLOAD_TOO_LARGE';
+      throw err;
+    }
+    chunks.push(buf);
+  }
   if (!chunks.length) return {};
-  return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
+  } catch (e) {
+    const err = new Error(`invalid json body: ${e.message}`);
+    throw err;
+  }
+}
+
+function createTimedAbortController(parentSignal, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => {
+    controller.abort(new Error(`upstream timeout after ${timeoutMs}ms`));
+  }, timeoutMs);
+
+  const clear = () => {
+    clearTimeout(timeout);
+  };
+
+  if (!parentSignal) return { signal: controller.signal, clear };
+  if (parentSignal.aborted) {
+    clear();
+    controller.abort(parentSignal.reason || new Error('request aborted'));
+    return { signal: controller.signal, clear };
+  }
+
+  const forwardAbort = () => {
+    clear();
+    if (!controller.signal.aborted) controller.abort(parentSignal.reason || new Error('request aborted'));
+  };
+
+  parentSignal.addEventListener('abort', forwardAbort, { once: true });
+
+  const cleanup = () => {
+    clear();
+    parentSignal.removeEventListener('abort', forwardAbort);
+  };
+
+  return { signal: controller.signal, clear: cleanup };
 }
 
 function trackEventFactory(stats, state) {
@@ -404,7 +487,7 @@ function trackEventFactory(stats, state) {
           ? obj.error.message
           : '';
       if (msg && !stats.failedMessage) {
-        stats.failedMessage = String(msg).replace(/Bearer\s+[A-Za-z0-9._-]+/g, 'Bearer ***').slice(0, 300);
+        stats.failedMessage = sanitizeErrorText(msg).slice(0, 300);
       }
     }
     if (obj && obj.response && typeof obj.response === 'object') {
@@ -428,7 +511,8 @@ async function proxyResponses(req, res, provider) {
   try {
     body = { ...(await readJsonBody(req)), stream: true };
   } catch (e) {
-    json(res, 400, { error: `invalid json body: ${e.message}` });
+    const status = e && e.code === 'PAYLOAD_TOO_LARGE' ? 413 : 400;
+    json(res, status, { error: sanitizeErrorText(e && e.message ? e.message : String(e)) });
     return;
   }
 
@@ -443,11 +527,12 @@ async function proxyResponses(req, res, provider) {
 
   let clientClosed = false;
   let currentAborter = null;
-  req.on('aborted', () => {
+  const abortStream = () => {
     clientClosed = true;
     try { if (currentAborter) currentAborter.abort(); } catch (_) {}
-  });
-  res.on('close', () => { clientClosed = true; });
+  };
+  req.on('aborted', () => abortStream());
+  res.on('close', () => { clientClosed = true; abortStream(); });
 
   setSseHeaders(res);
 
@@ -477,6 +562,7 @@ async function proxyResponses(req, res, provider) {
 
     const aborter = new AbortController();
     currentAborter = aborter;
+    const upstreamTimer = createTimedAbortController(aborter.signal, UPSTREAM_TIMEOUT_MS);
     let upstream;
     try {
       upstream = await fetch(provider.baseUrl, {
@@ -487,17 +573,21 @@ async function proxyResponses(req, res, provider) {
           Authorization: `Bearer ${provider.apiKey}`,
         },
         body: JSON.stringify(body),
-        signal: aborter.signal,
+        signal: upstreamTimer.signal,
       });
     } catch (e) {
-      sendFailed(res, `fetch upstream failed: ${e && e.message ? e.message : String(e)}`);
+      upstreamTimer.clear();
+      if (currentAborter === aborter) currentAborter = null;
+      sendFailed(res, sanitizeErrorText(`fetch upstream failed: ${e && e.message ? e.message : String(e)}`));
       return;
     }
 
     if (!upstream.ok || !upstream.body) {
       let detail = '';
       try { detail = await upstream.text(); } catch (_) {}
-      sendFailed(res, `upstream ${upstream.status}: ${String(detail).slice(0, 500)}`);
+      upstreamTimer.clear();
+      if (currentAborter === aborter) currentAborter = null;
+      sendFailed(res, sanitizeErrorText(`upstream ${upstream.status}: ${String(detail).slice(0, 500)}`));
       return;
     }
 
@@ -605,6 +695,7 @@ async function proxyResponses(req, res, provider) {
         })}\n\n`);
       }
     } finally {
+      upstreamTimer.clear();
       currentAborter = null;
       console.log(`[glm-proxy] [${reqId}] attempt ${attempt} end ${JSON.stringify({
         durMs: Date.now() - startedAt,
@@ -627,7 +718,8 @@ async function proxyChatCompletions(req, res, provider) {
   try {
     body = await readJsonBody(req);
   } catch (e) {
-    json(res, 400, { error: `invalid json body: ${e.message}` });
+    const status = e && e.code === 'PAYLOAD_TOO_LARGE' ? 413 : 400;
+    json(res, status, { error: sanitizeErrorText(e && e.message ? e.message : String(e)) });
     return;
   }
 
@@ -650,9 +742,23 @@ async function proxyChatCompletions(req, res, provider) {
   let streamedDiagnostics = false;
   let lastFailure = null;
   let consecutiveFailures = 0;
+  let clientClosed = false;
+  let currentAborter = null;
 
-  for (let attempt = 1; attempt <= (CHAT_BUSY_RETRY_MAX + 1) && !res.destroyed; attempt++) {
+  const abortStream = () => {
+    clientClosed = true;
+    if (currentAborter) {
+      try { currentAborter.abort(new Error('client closed')); } catch (_) {}
+    }
+  };
+  req.on('aborted', () => abortStream());
+  res.on('close', () => { clientClosed = true; });
+
+  for (let attempt = 1; attempt <= CHAT_TOTAL_ATTEMPTS && !res.destroyed; attempt++) {
     let upstream;
+    const aborter = new AbortController();
+    currentAborter = aborter;
+    const upstreamTimer = createTimedAbortController(aborter.signal, UPSTREAM_TIMEOUT_MS);
     try {
       upstream = await fetch(provider.chatCompletionsUrl, {
         method: 'POST',
@@ -662,9 +768,12 @@ async function proxyChatCompletions(req, res, provider) {
           Authorization: `Bearer ${provider.apiKey}`,
         },
         body: JSON.stringify(body || {}),
+        signal: upstreamTimer.signal,
       });
     } catch (e) {
-      const detail = `fetch upstream failed: ${e && e.message ? e.message : String(e)}`;
+      const detail = sanitizeErrorText(`fetch upstream failed: ${e && e.message ? e.message : String(e)}`);
+      upstreamTimer.clear();
+      currentAborter = null;
       lastFailure = { status: 502, detail };
       consecutiveFailures += 1;
       if (consecutiveFailures > CHAT_BUSY_RETRY_MAX) {
@@ -696,7 +805,9 @@ async function proxyChatCompletions(req, res, provider) {
     if (!upstream.ok) {
       let detail = '';
       try { detail = await upstream.text(); } catch (_) {}
-      lastFailure = { status: upstream.status, detail };
+      upstreamTimer.clear();
+      currentAborter = null;
+      lastFailure = { status: upstream.status, detail: sanitizeErrorText(detail) };
       if (isRetryableUpstreamFailure(upstream.status, detail)) {
         consecutiveFailures += 1;
         if (consecutiveFailures > CHAT_BUSY_RETRY_MAX) {
@@ -733,7 +844,7 @@ async function proxyChatCompletions(req, res, provider) {
       return;
     }
 
-    const contentType = upstream.headers.get('content-type') || (body && body.stream ? 'text/event-stream' : 'application/json');
+    const contentType = body && body.stream ? 'text/event-stream' : 'application/json';
     if (!res.headersSent) {
       res.writeHead(upstream.status, {
         'Content-Type': contentType,
@@ -743,6 +854,8 @@ async function proxyChatCompletions(req, res, provider) {
     }
 
     if (!upstream.body) {
+      upstreamTimer.clear();
+      currentAborter = null;
       res.end();
       return;
     }
@@ -753,13 +866,16 @@ async function proxyChatCompletions(req, res, provider) {
       }
     } catch (e) {
       if (!res.destroyed) {
-        res.write(`\n${JSON.stringify({ error: `stream error: ${e && e.message ? e.message : String(e)}` })}`);
+        res.write(`\n${JSON.stringify({ error: `stream error: ${sanitizeErrorText(e && e.message ? e.message : String(e))}` })}`);
       }
     } finally {
+      upstreamTimer.clear();
+      currentAborter = null;
       console.log(`[glm-proxy] [${reqId}] chat end ${JSON.stringify({
         status: upstream.status,
         attempt,
         streamedDiagnostics,
+        clientClosed,
         durMs: Date.now() - startedAt,
       })}`);
       try { res.end(); } catch (_) {}
@@ -791,12 +907,19 @@ async function route(req, res) {
       providerId: provider.id,
       providerName: provider.name,
       models: provider.models,
+      version: PACKAGE_VERSION,
       retryMax: BUSY_RETRY_MAX,
       chatRetryMax: CHAT_BUSY_RETRY_MAX,
+      chatRetryMaxAttempts: CHAT_TOTAL_ATTEMPTS,
       chatDiagnosticEvery: CHAT_DIAGNOSTIC_EVERY,
       chatSteadyRetryDelayMs: CHAT_STEADY_RETRY_DELAY_MS,
+      providerConfigFile: PROVIDERS_FILE,
+      upstreamTimeoutMs: UPSTREAM_TIMEOUT_MS,
+      maxRequestBytes: MAX_JSON_BODY_BYTES,
       upstream: provider.baseUrl,
       chatCompletionsUpstream: provider.chatCompletionsUrl,
+      uptimeMs: Date.now() - STARTED_AT,
+      startedAt: STARTED_AT,
     });
     return;
   }
