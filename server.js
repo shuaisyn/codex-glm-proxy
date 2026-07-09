@@ -7,7 +7,7 @@ const { StringDecoder } = require('string_decoder');
 
 const PORT = Math.max(1, parseInt(process.env.GLM_PROXY_PORT || '3017', 10) || 3017);
 const DEFAULT_PROVIDER_ID = process.env.XF_PROVIDER_ID || '5672307d-a380-433f-9a28-23c6b2ba95ea';
-const DEFAULT_PROVIDERS_FILE = path.resolve(__dirname, '..', 'MultiCC', 'providers.json');
+const DEFAULT_PROVIDERS_FILE = path.resolve(__dirname, 'providers.json');
 const PROVIDERS_FILE = process.env.MULTICC_PROVIDERS_JSON || DEFAULT_PROVIDERS_FILE;
 const BUSY_RETRY_MAX = Math.max(1, parseInt(process.env.XF_BUSY_RETRY_MAX || '8', 10) || 8);
 const BUSY_RETRY_DELAYS_MS = [250, 600, 1200, 2200, 4000, 6500, 9000];

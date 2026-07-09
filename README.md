@@ -6,7 +6,7 @@
 
 - 提供 `http://127.0.0.1:3017/v1/responses` 给 Codex 使用。
 - 提供 `http://127.0.0.1:3017/v1/chat/completions` 给 AionUI/OpenAI 兼容客户端使用。
-- 从 `..\MultiCC\providers.json` 读取本地讯飞 MaaS provider 配置和密钥。
+- 从仓库根目录的 `providers.json` 读取本地讯飞 MaaS provider 配置和密钥（可用 `MULTICC_PROVIDERS_JSON` 覆盖）。
 - 不复制、不打印、不提交密钥。
 - 对讯飞 `10012 / EngineInternalError:1105 / system busy` 做代理层重试。
 - AionUI 使用 `/v1/chat/completions` 流式调用时，上游 408/429/500/502/503/504 或忙碌错误会直接在会话面板里显示代理重试提示；默认最多重试 5 次，只有连续重试仍拿不到有效上游响应时才中断本次流式请求，让用户重新发送。

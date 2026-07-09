@@ -1,0 +1,29 @@
+{
+    "providers":  [
+                      {
+                          "models":  "xopglm52,xopdeepseekv4pro",
+                          "model":  "xopglm52",
+                          "settingsConfig":  {
+                                                 "proxyTarget":  {
+                                                                     "baseUrl":  "https://maas-coding-api.cn-huabei-1.xf-yun.com/v1/responses",
+                                                                     "chatCompletionsUrl":  "https://maas-coding-api.cn-huabei-1.xf-yun.com/v2/chat/completions",
+                                                                     "apiKey":  "fb661d6aac6bbe84e20c8fa1b989fda3:YmNlZjAxZDc5ZjExMGY1NTFhODNlNTNi"
+                                                                 },
+                                                 "modelCatalog":  {
+                                                                      "models":  [
+                                                                                     {
+                                                                                         "slug":  "xopglm52",
+                                                                                         "model":  "xopglm52"
+                                                                                     },
+                                                                                     {
+                                                                                         "slug":  "xopdeepseekv4pro",
+                                                                                         "model":  "xopdeepseekv4pro"
+                                                                                     }
+                                                                                 ]
+                                                                  }
+                                             },
+                          "name":  "xf-coding-5.2",
+                          "id":  "5672307d-a380-433f-9a28-23c6b2ba95ea"
+                      }
+                  ]
+}
