@@ -54,6 +54,21 @@ const PACKAGE_VERSION = (() => {
 const STARTED_AT = Date.now();
 const CHAT_TOTAL_ATTEMPTS = CHAT_BUSY_RETRY_MAX + 1;
 
+// Force every request to use this reasoning effort, regardless of what the
+// client sends. Set to '' (empty) to disable and pass through unchanged.
+// Valid values: 'low' | 'medium' | 'high' | 'xhigh' (xhigh only if upstream supports it)
+const FORCE_REASONING_EFFORT = process.env.GLM_FORCE_REASONING_EFFORT || 'high';
+
+function forceReasoningEffort(body) {
+  if (!body || typeof body !== 'object') return body;
+  if (!FORCE_REASONING_EFFORT) return body;
+  // OpenAI Responses API style: reasoning: { effort: "high" }
+  body.reasoning = { ...(body.reasoning || {}), effort: FORCE_REASONING_EFFORT };
+  // OpenAI Chat Completions style: reasoning_effort: "high"
+  body.reasoning_effort = FORCE_REASONING_EFFORT;
+  return body;
+}
+
 let requestSeq = 0;
 let codexModelCatalogBySlug = null;
 
@@ -704,6 +719,7 @@ async function proxyResponses(req, res, provider) {
     json(res, status, { error: sanitizeErrorText(e && e.message ? e.message : String(e)) });
     return;
   }
+  body = forceReasoningEffort(body);
 
   const reqId = `glm-${(++requestSeq).toString(36)}`;
   const startedAt = Date.now();
@@ -960,6 +976,7 @@ async function proxyChatCompletions(req, res, provider) {
   }
 
   body = sanitizeChatBody(body);
+  body = forceReasoningEffort(body);
 
   const reqId = `chat-${(++requestSeq).toString(36)}`;
   const startedAt = Date.now();

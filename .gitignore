@@ -3,3 +3,5 @@ logs/
 *.local.json
 requests*.log
 requests*.err.log
+.aionrs/
+.codex/
