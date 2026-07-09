@@ -193,6 +193,40 @@ function extractUsageFromObj(obj, provider) {
   return null;
 }
 
+function patchCompletedResponsePayload(payload, provider) {
+  if (!payload || typeof payload !== 'object') return null;
+  if (payload.type !== 'response.completed' || !payload.response || typeof payload.response !== 'object') return null;
+
+  const usage = extractUsageFromObj(payload, provider) || buildFallbackUsage(provider);
+  if (!usage) return null;
+  const existingUsage = payload.response.usage && typeof payload.response.usage === 'object'
+    ? normalizeUsage(payload.response.usage, provider)
+    : null;
+
+  const finalUsage = existingUsage || usage;
+  const rawUsage = payload.response.usage || {};
+  const hasProviderKey = rawUsage && Object.prototype.hasOwnProperty.call(rawUsage, 'provider');
+  const shouldPatchProvider = !hasProviderKey || isZeroLikeProvider(rawUsage.provider);
+  const shouldPatchTokens = !existingUsage
+    || existingUsage.prompt_tokens == null
+    || existingUsage.completion_tokens == null
+    || existingUsage.total_tokens == null;
+
+  if (!shouldPatchProvider && !shouldPatchTokens) return null;
+
+  if (finalUsage) {
+    return {
+      ...payload,
+      response: {
+        ...(payload.response || {}),
+        usage: finalUsage,
+      },
+    };
+  }
+
+  return null;
+}
+
 function buildFallbackUsage(provider) {
   return {
     provider: provider.id,
@@ -791,9 +825,40 @@ async function proxyResponses(req, res, provider) {
         stats.bytes += value.byteLength;
         buffer += decoder.write(value);
         let nl;
+        let currentEventLine = '';
         while ((nl = buffer.indexOf('\n')) >= 0) {
           const line = buffer.slice(0, nl);
           buffer = buffer.slice(nl + 1);
+          if (line.startsWith('event:')) {
+            currentEventLine = line.slice(6).trim();
+            trackLine(line);
+            writeOut(line + '\n');
+            continue;
+          }
+
+          if (line.startsWith('data:')) {
+            let outLine = line;
+            if (currentEventLine === 'response.completed') {
+              const dataLine = line.slice(5).trimStart();
+              if (dataLine && dataLine !== '[DONE]') {
+                try {
+                  const parsed = JSON.parse(dataLine);
+                  const patched = patchCompletedResponsePayload(parsed, provider);
+                  if (patched && patched.response) {
+                    if (patched.response.usage) {
+                      state.responseMeta = { ...(state.responseMeta || {}), ...patched.response };
+                      state.usage = patched.response.usage;
+                    }
+                    outLine = `data: ${JSON.stringify(patched)}`;
+                  }
+                } catch (_) {}
+              }
+            }
+            trackLine(line);
+            writeOut(outLine + '\n');
+            continue;
+          }
+
           trackLine(line);
           writeOut(line + '\n');
 
