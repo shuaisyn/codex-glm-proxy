@@ -22,6 +22,8 @@ if (!(Test-Path $Node)) {
 
 $env:GLM_PROXY_PORT = [string]$Port
 $env:XF_PROVIDER_ID = $ProviderId
+if (-not $env:XF_CHAT_BUSY_RETRY_MAX) { $env:XF_CHAT_BUSY_RETRY_MAX = '5' }
+if (-not $env:XF_CHAT_STEADY_RETRY_DELAY_MS) { $env:XF_CHAT_STEADY_RETRY_DELAY_MS = '10000' }
 
 $LogDir = Join-Path $Root "logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
