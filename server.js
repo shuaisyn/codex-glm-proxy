@@ -83,6 +83,134 @@ function sanitizeErrorText(value, maxLen = 1200) {
     .slice(0, maxLen);
 }
 
+function isZeroLikeProvider(value) {
+  if (value == null) return true;
+  if (typeof value === 'number') return value === 0;
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim().toLowerCase();
+  return normalized === '' || normalized === '0' || normalized === 'null' || normalized === 'undefined';
+}
+
+function toTokenNumber(value) {
+  if (value == null || value === '') return null;
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return null;
+  return Math.floor(num);
+}
+
+function pickTokenNumber(source, ...names) {
+  if (!source || typeof source !== 'object') return null;
+  for (const name of names) {
+    const value = pickTokenNumberFromKey(source, name);
+    if (value != null) return value;
+  }
+  return null;
+}
+
+function pickTokenNumberFromKey(source, key) {
+  if (!Object.prototype.hasOwnProperty.call(source, key)) return null;
+  return toTokenNumber(source[key]);
+}
+
+function normalizeUsage(rawUsage, provider) {
+  if (!rawUsage || typeof rawUsage !== 'object') return null;
+
+  const promptTokens = pickTokenNumber(
+    rawUsage,
+    'prompt_tokens',
+    'promptTokens',
+    'input_tokens',
+    'inputTokens',
+    'input_token_count',
+    'inputTokensCount',
+  );
+  const completionTokens = pickTokenNumber(
+    rawUsage,
+    'completion_tokens',
+    'completionTokens',
+    'output_tokens',
+    'outputTokens',
+    'output_token_count',
+    'outputTokensCount',
+  );
+  let totalTokens = pickTokenNumber(
+    rawUsage,
+    'total_tokens',
+    'totalTokens',
+    'all_tokens',
+    'token_count',
+    'total_token_count',
+  );
+  if (totalTokens == null && promptTokens != null && completionTokens != null) {
+    totalTokens = promptTokens + completionTokens;
+  }
+  const usage = {
+    ...rawUsage,
+  };
+
+  if (isZeroLikeProvider(rawUsage.provider)) {
+    usage.provider = provider.id;
+  } else if (Object.prototype.hasOwnProperty.call(rawUsage, 'provider')) {
+    usage.provider = rawUsage.provider;
+  } else {
+    usage.provider = provider.id;
+  }
+
+  if (promptTokens != null) usage.prompt_tokens = promptTokens;
+  if (completionTokens != null) usage.completion_tokens = completionTokens;
+  if (totalTokens != null) usage.total_tokens = totalTokens;
+
+  if (usage.prompt_tokens == null && usage.completion_tokens == null && usage.total_tokens == null) {
+    return null;
+  }
+  return usage;
+}
+
+function extractUsageFromObj(obj, provider) {
+  if (!obj || typeof obj !== 'object') return null;
+  const directUsage = obj.usage && normalizeUsage(obj.usage, provider);
+  if (directUsage) return directUsage;
+
+  const response = obj.response;
+  if (response && typeof response === 'object') {
+    const nestedUsage = normalizeUsage(response.usage, provider);
+    if (nestedUsage) return nestedUsage;
+
+    const metricsUsage = normalizeUsage(response.metrics, provider);
+    if (metricsUsage) return metricsUsage;
+
+    const responseFieldsUsage = normalizeUsage({
+      provider: response.provider,
+      prompt_tokens: response.prompt_tokens,
+      input_tokens: response.input_tokens,
+      completion_tokens: response.completion_tokens,
+      output_tokens: response.output_tokens,
+      total_tokens: response.total_tokens,
+    }, provider);
+    if (responseFieldsUsage) return responseFieldsUsage;
+  }
+
+  return null;
+}
+
+function buildFallbackUsage(provider) {
+  return {
+    provider: provider.id,
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+  };
+}
+
+function normalizeProviderQueryId(providerId = DEFAULT_PROVIDER_ID) {
+  if (providerId == null) return DEFAULT_PROVIDER_ID;
+  const normalized = String(providerId).trim();
+  if (!normalized || normalized === '0' || normalized === 'false' || normalized === 'null' || normalized === 'undefined') {
+    return DEFAULT_PROVIDER_ID;
+  }
+  return normalized;
+}
+
 function isTransientXfBusy(message) {
   return /EngineInternalError:1105|system is busy|try again later|code:\s*10012/i.test(String(message || ''));
 }
@@ -254,7 +382,8 @@ function readProvider(providerId = DEFAULT_PROVIDER_ID) {
     throw new Error(`cannot read provider config: ${PROVIDERS_FILE}`);
   }
 
-  const provider = providerList(raw).find(p => p && (p.id === providerId || p.name === providerId));
+  const providers = providerList(raw);
+  const provider = providers.find(p => p && (p.id === providerId || p.name === providerId));
   if (!provider) throw new Error(`provider not found: ${providerId}`);
 
   const cfg = provider.settingsConfig && typeof provider.settingsConfig === 'object'
@@ -302,9 +431,14 @@ function modelPayload(provider) {
       description: 'iFlytek MaaS Coding Plan Astron Code Latest.',
       priority: 10,
     },
+    xopglm52: {
+      displayName: 'GLM5.2',
+      description: 'iFlytek MaaS Coding Plan GLM-5.2.',
+      priority: 15,
+    },
     xopdeepseekv4pro: {
-      displayName: 'DeepSeek-V4-Pro',
-      description: 'iFlytek MaaS Coding Plan DeepSeek-V4-Pro.',
+      displayName: 'DeepSeek V4 Pro',
+      description: 'iFlytek MaaS Coding Plan DeepSeek V4 Pro.',
       priority: 20,
     },
     xopdeepseekv4flash: {
@@ -329,7 +463,7 @@ function modelPayload(provider) {
       ...cached,
       id,
       slug: id,
-      name: id,
+      name: info.displayName,
       display_name: info.displayName,
       displayName: info.displayName,
       description: info.description,
@@ -461,7 +595,7 @@ function createTimedAbortController(parentSignal, timeoutMs) {
   return { signal: controller.signal, clear: cleanup };
 }
 
-function trackEventFactory(stats, state) {
+function trackEventFactory(stats, state, provider) {
   let currentEvent = '';
   let currentData = [];
   return function track(rawLine) {
@@ -508,9 +642,12 @@ function trackEventFactory(stats, state) {
         stats.failedMessage = sanitizeErrorText(msg).slice(0, 300);
       }
     }
+    const usage = extractUsageFromObj(obj, provider);
+    if (usage) {
+      state.usage = usage;
+    }
     if (obj && obj.response && typeof obj.response === 'object') {
       state.responseMeta = { ...(state.responseMeta || {}), ...obj.response };
-      if (obj.response.usage) state.usage = obj.response.usage;
       if (Array.isArray(obj.response.output)) {
         obj.response.output.forEach((item, idx) => { state.outputItems[idx] = item; });
       }
@@ -622,7 +759,7 @@ async function proxyResponses(req, res, provider) {
     let retryBusy = false;
     let stopAfterTerminalEvent = false;
     const pendingWrites = [];
-    const trackLine = trackEventFactory(stats, state);
+    const trackLine = trackEventFactory(stats, state, provider);
 
     const writeOut = (text) => {
       if (clientClosed) return;
@@ -710,6 +847,9 @@ async function proxyResponses(req, res, provider) {
           status: 'completed',
           output: state.outputItems.filter(Boolean),
         };
+        if (!state.usage && (state.completed || state.responseMeta)) {
+          state.usage = buildFallbackUsage(provider);
+        }
         if (state.usage) response.usage = state.usage;
         stats.injectedCompleted = true;
         res.write(`\n\nevent: response.completed\ndata: ${JSON.stringify({
@@ -921,7 +1061,7 @@ async function proxyChatCompletions(req, res, provider) {
 
 async function route(req, res) {
   const url = new URL(req.url, `http://${req.headers.host || '127.0.0.1'}`);
-  const providerId = url.searchParams.get('provider') || DEFAULT_PROVIDER_ID;
+  const providerId = normalizeProviderQueryId(url.searchParams.get('provider'));
 
   let provider;
   try {
