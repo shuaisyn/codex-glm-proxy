@@ -10,7 +10,7 @@
 - 也可用 `GLM_PROVIDERS_JSON` / `XF_PROVIDERS_JSON` / `MULTICC_PROVIDERS_JSON` 覆盖。
 - 不复制、不打印、不提交密钥。
 - 对讯飞 `10012 / EngineInternalError:1105 / system busy` 做代理层重试。
-- AionUI 使用 `/v1/chat/completions` 流式调用时，上游 408/429/500/502/503/504 或忙碌错误会直接在会话面板里显示代理重试提示；默认最多重试 5 次，只有连续重试仍拿不到有效上游响应时才中断本次流式请求，让用户重新发送。
+- AionUI 使用 `/v1/chat/completions` 流式调用时，上游 408/429/500/502/503/504 或忙碌错误会直接在会话面板里显示代理重试提示；默认按稳态间隔持续重试，客户端关闭请求可立即停止。
 - 如果上游有输出但缺少 `response.completed`，在代理层补齐，减少 Codex 外层断流。
 
 ## 常用命令
@@ -58,8 +58,8 @@
 - `GLM_PROVIDERS_JSON`
 - `XF_PROVIDERS_JSON`
 - `MULTICC_PROVIDERS_JSON`
-- `XF_BUSY_RETRY_MAX`：`/v1/responses` 最多重试次数（`/health` 中 `responsesRetryMax` 显示）。
-- `XF_CHAT_BUSY_RETRY_MAX`：`/v1/chat/completions` 最多重试次数（`/health` 中 `chatRetryMax` 显示）。
+- `XF_BUSY_RETRY_MAX`：`/v1/responses` 的重试上限配置；当前实现会按 `responsesRetryMax` 对应的最高重试档位间隔持续重试，直到客户端中断。
+- `XF_CHAT_BUSY_RETRY_MAX`：`/v1/chat/completions` 的重试上限配置；当前实现会按稳态间隔持续重试，直到客户端中断。
 - `XF_CHAT_DIAGNOSTIC_EVERY`：每多少次失败在 AionUI 面板打印一次重试提示。
 - `XF_CHAT_STEADY_RETRY_DELAY_MS`：`chat/completions` 持续重试间隔。
 - `XF_UPSTREAM_TIMEOUT_MS`：上游请求超时（默认按 profile 下发）。
